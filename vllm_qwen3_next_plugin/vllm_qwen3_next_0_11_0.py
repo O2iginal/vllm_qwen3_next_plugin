@@ -295,9 +295,14 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         set_weight_attrs(self.dt_bias,
                          {"weight_loader": sharded_weight_loader(0)})
 
+        if "HACK_GDN_EPS" in os.environ:
+            gdn_eps = float(os.getenv('HACK_GDN_EPS'))
+            print(f"HACK_GDN_EPS 生效： {gdn_eps}")
+        else:
+            gdn_eps = self.layer_norm_epsilon
         self.norm = RMSNormGated(
             self.head_v_dim,
-            eps=self.layer_norm_epsilon,
+            eps=gdn_eps,
             group_size=None,
             norm_before_gate=True,
             device=current_platform.current_device(),
