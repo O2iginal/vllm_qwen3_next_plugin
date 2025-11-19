@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3Next model."""
+import os
 from collections.abc import Iterable
 from itertools import islice
 from typing import Optional
@@ -138,9 +139,12 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             )
         else:
             self.shared_expert = None
-        self.shared_expert_gate = torch.nn.Linear(config.hidden_size,
-                                                  1,
-                                                  bias=False)
+        if os.environ.get("USE_SHARED_EXPERT_GATE", "0") == "1":
+            self.shared_expert_gate = torch.nn.Linear(config.hidden_size,
+                                                    1,
+                                                    bias=False)
+        else:
+            self.shared_expert_gate = None
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # NOTE: hidden_states can have either 1D or 2D shape.
@@ -947,7 +951,7 @@ class Qwen3NextModel(nn.Module):
         # 如果没有专家，返回空列表
         if self.config.num_experts == 0:
             return []
-            
+
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
         return FusedMoE.make_expert_params_mapping(
@@ -1130,7 +1134,7 @@ class Qwen3NextForCausalLM(nn.Module, HasInnerState, SupportsLoRA, SupportsPP,
         # 如果没有 MoE 层，直接返回
         if self.config.num_experts == 0:
             return
-            
+
         for layer_idx, layer in enumerate(self.moe_layers):
             # Register the expert weights.
             self.expert_weights.append(layer.get_expert_weights())
@@ -1149,7 +1153,7 @@ class Qwen3NextForCausalLM(nn.Module, HasInnerState, SupportsLoRA, SupportsPP,
         # 如果没有 MoE 层，直接返回
         if self.config.num_experts == 0:
             return
-            
+
         assert self.num_local_physical_experts == num_local_physical_experts
         self.num_physical_experts = num_physical_experts
         self.num_local_physical_experts = num_local_physical_experts

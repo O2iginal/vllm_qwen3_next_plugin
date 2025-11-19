@@ -9,7 +9,12 @@ def register():
     vllm_version = vllm.__version__
     
     if vllm_version.startswith("0.10.2") or vllm_version.startswith("0.11.0"):
-        from .vllm_qwen3_next_0_10_2 import Qwen3NextForCausalLM
+        # Import Qwen3NextForCausalLM based on vLLM version
+        if vllm_version.startswith("0.10.2"):
+            from .vllm_qwen3_next_0_10_2 import Qwen3NextForCausalLM
+        elif vllm_version.startswith("0.11.0"):
+            from .vllm_qwen3_next_0_11_0 import Qwen3NextForCausalLM
+        
         print(f"{GREEN}[vLLM Plugin] Loaded implementation for vLLM {vllm_version}{RESET}")
         
         # Register Qwen3NextForCausalLM

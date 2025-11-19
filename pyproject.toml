@@ -9,7 +9,7 @@ description = "vLLM Qwen3Next model plugin with custom support (includes MTP sup
 dependencies = [
     "vllm>=0.10.2,<=0.11.0"
 ]
-  
+
 [project.entry-points."vllm.general_plugins"]  
 register_qwen3_next_model = "vllm_qwen3_next_plugin:register"  
   

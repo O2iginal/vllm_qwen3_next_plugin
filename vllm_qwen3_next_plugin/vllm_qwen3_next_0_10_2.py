@@ -174,9 +174,12 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             )
         else:
             self.shared_expert = None
-        self.shared_expert_gate = torch.nn.Linear(config.hidden_size,
-                                                  1,
-                                                  bias=False)
+        if os.environ.get("USE_SHARED_EXPERT_GATE", "0") == "1":
+            self.shared_expert_gate = torch.nn.Linear(config.hidden_size,
+                                                    1,
+                                                    bias=False)
+        else:
+            self.shared_expert_gate = None
 
     def _maybe_ignore_quant_config(self, quant_config: QuantizationConfig):
         # GPTQ configs do not have a list of ignored modules, however AutoGPTQ
