@@ -659,10 +659,13 @@ class Qwen3NextAttention(nn.Module):
             self.head_dim,
             self.total_num_heads * (1 + self.attn_output_gate),
             self.total_num_kv_heads,
-            bias=getattr(config, "qkv_bias", False),
+            bias=getattr(config, "attention_bias", True),
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
         )
+
+        attention_bias=getattr(config, "attention_bias", "undefined")
+        print(f"[DEBUG] {[attention_bias]=}")
 
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
