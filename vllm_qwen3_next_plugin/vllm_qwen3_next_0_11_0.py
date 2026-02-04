@@ -69,6 +69,10 @@ logger = init_logger(__name__)
 
 KVCache = tuple[torch.Tensor, torch.Tensor]
 
+def show_tensor_info(tensor: torch.Tensor, name: str):
+    print(
+        f"[Tensor Info] {name}: shape={tensor.shape}, has_nan={torch.isnan(tensor).any().item()}, has_inf={torch.isinf(tensor).any().item()}, mean={tensor.mean().item()}, std={tensor.std().item()}"
+    )
 
 class Qwen3NextSparseMoeBlock(nn.Module):
 
@@ -139,7 +143,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             )
         else:
             self.shared_expert = None
-        if os.environ.get("USE_SHARED_EXPERT_GATE", "0") == "1":
+        if getattr(config, "use_shared_expert_gate", False):
             self.shared_expert_gate = torch.nn.Linear(config.hidden_size,
                                                     1,
                                                     bias=False)
@@ -510,6 +514,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         beta = b.sigmoid()
         # g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
         g = fused_gdn_gating(self.A_log, a, self.dt_bias)
+
         g, beta = map(lambda x: rearrange(x, 'l d -> 1 l d'), (g, beta))
 
         if spec_sequence_masks is not None:
@@ -1088,6 +1093,9 @@ class Qwen3NextForCausalLM(nn.Module, HasInnerState, SupportsLoRA, SupportsPP,
             # compatibility
             if not lora_config else lora_config.lora_vocab_padding_size,
             prefix=maybe_prefix(prefix, "lm_head"))
+        # Tie lm_head weight with embed_tokens weight if tie_word_embeddings is True
+        if getattr(config, "tie_word_embeddings", False):
+            self.lm_head.weight = self.model.embed_tokens.weight
         self.logits_processor = LogitsProcessor(self.unpadded_vocab_size,
                                                 config.vocab_size)
         self.make_empty_intermediate_tensors = (
@@ -1188,7 +1196,6 @@ class Qwen3NextForCausalLM(nn.Module, HasInnerState, SupportsLoRA, SupportsPP,
     ):
         hidden_states = self.model(input_ids, positions, intermediate_tensors,
                                    inputs_embeds)
-
         return hidden_states
 
     @classmethod
@@ -1227,7 +1234,14 @@ class Qwen3NextForCausalLM(nn.Module, HasInnerState, SupportsLoRA, SupportsPP,
             self,
             skip_prefixes=["mtp."],
         )
-        return loader.load_weights(weights)
+        loaded_params = loader.load_weights(weights)
+        # If tie_word_embeddings is True, lm_head.weight is tied to embed_tokens.weight
+        # So we need to mark lm_head.weight as loaded even if it's not in the checkpoint
+        if getattr(self.config, "tie_word_embeddings", False):
+            # Add lm_head.weight to loaded_params to avoid "not initialized" error
+            # The weight is actually initialized via the tie with embed_tokens.weight
+            loaded_params.add("lm_head.weight")
+        return loaded_params
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()

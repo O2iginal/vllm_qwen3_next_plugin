@@ -1,6 +1,24 @@
 GREEN = "\033[32m"
 RESET = "\033[0m"
 
+# Module-level import for direct access to Qwen3NextForCausalLM
+try:
+    import vllm
+    vllm_version = vllm.__version__
+    
+    if vllm_version.startswith("0.10.2"):
+        from .vllm_qwen3_next_0_10_2 import Qwen3NextForCausalLM
+    elif vllm_version.startswith("0.11.0"):
+        from .vllm_qwen3_next_0_11_0 import Qwen3NextForCausalLM
+    else:
+        # Default to 0.11.0 if version check fails
+        from .vllm_qwen3_next_0_11_0 import Qwen3NextForCausalLM
+except ImportError:
+    # Fallback if vllm is not available
+    from .vllm_qwen3_next_0_11_0 import Qwen3NextForCausalLM
+
+__all__ = ['Qwen3NextForCausalLM', 'register']
+
 def register():
     from vllm import ModelRegistry
     import vllm
