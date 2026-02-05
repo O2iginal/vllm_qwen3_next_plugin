@@ -31,9 +31,11 @@ from vllm.model_executor.layers.layernorm import (
     RMSNorm as Qwen3NextRMSNorm) # @gyzp change from GemmaRMSNorm to RMSNorm
 # yapf: enable
 from vllm.model_executor.layers.linear import (ColumnParallelLinear,
+                                               MergedColumnParallelLinear,
                                                QKVParallelLinear,
                                                ReplicatedLinear,
                                                RowParallelLinear)
+from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.mamba.mamba_mixer2 import (
@@ -69,10 +71,117 @@ logger = init_logger(__name__)
 
 KVCache = tuple[torch.Tensor, torch.Tensor]
 
+
+def _apply_causal_depthwise_conv1d_bcl(
+    x_bcl: torch.Tensor,
+    weight_c1w: torch.Tensor,
+) -> torch.Tensor:
+    """Apply causal depthwise Conv1d for token shifting (cannon layer). Stateless.
+    x_bcl: [B, C, L], weight_c1w: [C, 1, W]. Output: [B, C, L].
+    Use F.pad + F.conv1d only; causal_conv1d_fn requires conv_states (Mamba) and breaks torch.compile.
+    """
+    w = weight_c1w.shape[-1]
+    x_pad = F.pad(x_bcl, (w - 1, 0))
+    y = F.conv1d(
+        x_pad,
+        weight_c1w,
+        bias=None,
+        stride=1,
+        padding=0,
+        groups=weight_c1w.shape[0],
+    )
+    return y[..., :x_bcl.shape[-1]]
+
 def show_tensor_info(tensor: torch.Tensor, name: str):
     print(
         f"[Tensor Info] {name}: shape={tensor.shape}, has_nan={torch.isnan(tensor).any().item()}, has_inf={torch.isinf(tensor).any().item()}, mean={tensor.mean().item()}, std={tensor.std().item()}"
     )
+
+
+class Qwen3NextMLPWithTokenShift(nn.Module):
+    """MLP with optional token shifting (cannon layer) at entry and before down_proj.
+    Uses MergedColumnParallelLinear(gate_up_proj) so load_weights matches Qwen2MoeMLP.
+    """
+
+    def __init__(
+        self,
+        config: Qwen3NextConfig,
+        quant_config: Optional[QuantizationConfig],
+        prefix: str = "",
+        reduce_results: bool = True,
+    ) -> None:
+        super().__init__()
+        hidden_size = config.hidden_size
+        intermediate_size = config.intermediate_size
+        if config.hidden_act != "silu":
+            raise ValueError(
+                "Qwen3NextMLPWithTokenShift only supports hidden_act='silu' (same as Qwen2MoeMLP)."
+            )
+        kernel_size = getattr(config, "token_shift_conv_size", 4)
+        self.ffn_token_shift = getattr(config, "ffn_token_shift", None)
+        self.ffn_intermediate_token_shift = getattr(
+            config, "ffn_intermediate_token_shift", None
+        )
+        self.gate_up_proj = MergedColumnParallelLinear(
+            hidden_size,
+            [intermediate_size] * 2,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.gate_up_proj",
+        )
+        self.down_proj = RowParallelLinear(
+            intermediate_size,
+            hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            reduce_results=reduce_results,
+            prefix=f"{prefix}.down_proj",
+        )
+        self.act_fn = SiluAndMul()
+        if self.ffn_token_shift == "conv":
+            self.token_shift_conv = nn.Conv1d(
+                hidden_size,
+                hidden_size,
+                kernel_size=kernel_size,
+                padding=0,
+                groups=hidden_size,
+                bias=False,
+            )
+        else:
+            self.token_shift_conv = None
+        if self.ffn_intermediate_token_shift == "conv":
+            self.intermediate_token_shift_conv = nn.Conv1d(
+                intermediate_size,
+                intermediate_size,
+                kernel_size=kernel_size,
+                padding=0,
+                groups=intermediate_size,
+                bias=False,
+            )
+        else:
+            self.intermediate_token_shift_conv = None
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.ffn_token_shift == "conv" and self.token_shift_conv is not None:
+            x_bcl = hidden_states.t().unsqueeze(0)
+            x_bcl = _apply_causal_depthwise_conv1d_bcl(
+                x_bcl, self.token_shift_conv.weight
+            )
+            hidden_states = x_bcl.squeeze(0).t()
+        gate_up, _ = self.gate_up_proj(hidden_states)
+        intermediate = self.act_fn(gate_up)
+        if (
+            self.ffn_intermediate_token_shift == "conv"
+            and self.intermediate_token_shift_conv is not None
+        ):
+            inter_bcl = intermediate.t().unsqueeze(0)
+            inter_bcl = _apply_causal_depthwise_conv1d_bcl(
+                inter_bcl, self.intermediate_token_shift_conv.weight
+            )
+            intermediate = inter_bcl.squeeze(0).t()
+        down, _ = self.down_proj(intermediate)
+        return down
+
 
 class Qwen3NextSparseMoeBlock(nn.Module):
 
@@ -131,6 +240,21 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                                      quant_config=quant_config,
                                      prefix=f"{prefix}.gate")
 
+        # Token shift at MoE entry (cannon layer, reuses ffn_token_shift) @o2iginal
+        self.ffn_token_shift = getattr(config, "ffn_token_shift", None)
+        kernel_size = getattr(config, "token_shift_conv_size", 4)
+        if self.ffn_token_shift == "conv":
+            self.token_shift_conv = nn.Conv1d(
+                config.hidden_size,
+                config.hidden_size,
+                kernel_size=kernel_size,
+                padding=0,
+                groups=config.hidden_size,
+                bias=False,
+            )
+        else:
+            self.token_shift_conv = None
+
         if config.shared_expert_intermediate_size > 0:
             self.shared_expert = Qwen3NextMLP(
                 hidden_size=config.hidden_size,
@@ -155,6 +279,14 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         orig_shape = hidden_states.shape
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
+
+        # Token shift at MoE entry (cannon layer, conv mode) @o2iginal
+        if self.ffn_token_shift == "conv" and self.token_shift_conv is not None:
+            x_bcl = hidden_states.t().unsqueeze(0)
+            x_bcl = _apply_causal_depthwise_conv1d_bcl(
+                x_bcl, self.token_shift_conv.weight
+            )
+            hidden_states = x_bcl.squeeze(0).t()
 
         if self.is_sequence_parallel:
             hidden_states = sequence_parallel_chunk(hidden_states)
@@ -786,13 +918,38 @@ class Qwen3NextDecoderLayer(nn.Module):
         else:
             raise ValueError(f"Invalid layer_type {self.layer_type}")
 
+        # Attn token shift (cannon layer) before attention @o2iginal
+        self.attn_token_shift = getattr(config, "attn_token_shift", None)
+        kernel_size = getattr(config, "token_shift_conv_size", 4)
+        if self.attn_token_shift == "conv":
+            self.attn_token_shift_conv = nn.Conv1d(
+                config.hidden_size,
+                config.hidden_size,
+                kernel_size=kernel_size,
+                padding=0,
+                groups=config.hidden_size,
+                bias=False,
+            )
+        else:
+            self.attn_token_shift_conv = None
+
         mlp_only_layers = ([] if not hasattr(config, "mlp_only_layers") else
                            config.mlp_only_layers)
+        use_mlp_token_shift = (
+            getattr(config, "ffn_token_shift", None) is not None
+            or getattr(config, "ffn_intermediate_token_shift", None) is not None
+        )
         if (self.layer_idx not in mlp_only_layers) and (
                 config.num_experts > 0 and
             (self.layer_idx + 1) % config.decoder_sparse_step == 0):
             self.mlp = Qwen3NextSparseMoeBlock(
                 vllm_config=vllm_config,
+                prefix=f"{prefix}.mlp",
+            )
+        elif use_mlp_token_shift:
+            self.mlp = Qwen3NextMLPWithTokenShift(
+                config=config,
+                quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
             )
         else:
@@ -838,6 +995,18 @@ class Qwen3NextDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(
                 hidden_states, residual)
+
+        # Attn token shift (cannon layer, conv mode) before attention @o2iginal
+        if (
+            self.attn_token_shift == "conv"
+            and self.attn_token_shift_conv is not None
+        ):
+            # hidden_states: [num_tokens, hidden] -> [1, hidden, num_tokens]
+            x_bcl = hidden_states.t().unsqueeze(0)
+            x_bcl = _apply_causal_depthwise_conv1d_bcl(
+                x_bcl, self.attn_token_shift_conv.weight
+            )
+            hidden_states = x_bcl.squeeze(0).t()
 
         self_attention_output = torch.empty_like(hidden_states)
         if self.layer_type == "linear_attention":
@@ -1038,12 +1207,15 @@ class Qwen3NextModel(nn.Module):
                                   expert_id=expert_id)
                     break
                 else:
-                    # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue
                     if is_pp_missing_parameter(name, self):
                         continue
-                    param = params_dict[name]
+                    # Resolve key: loader may pass "model.layers.*" but params_dict has "layers.*"
+                    key = name if name in params_dict else (name.removeprefix("model.") if name.startswith("model.") else name)
+                    if key not in params_dict:
+                        continue
+                    param = params_dict[key]
                     weight_loader = getattr(param, "weight_loader",
                                             default_weight_loader)
                     weight_loader(param, loaded_weight)

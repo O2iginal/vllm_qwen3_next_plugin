@@ -223,6 +223,15 @@ class Qwen3NextConfig(PretrainedConfig):
         router_aux_loss_coef=0.001,
         mlp_only_layers=None,
         layer_types=None,
+        # Token shifting (cannon layer): None | "cat" | "conv" @o2iginal
+        ffn_token_shift=None,
+        ffn_intermediate_token_shift=None,
+        attn_token_shift=None,
+        attn_q_token_shift=None,
+        attn_k_token_shift=None,
+        attn_v_token_shift=None,
+        token_shift_conv_size=4,
+        token_shift_conv_init="default",
         **kwargs,
     ):
         if mlp_only_layers is None:
@@ -272,6 +281,16 @@ class Qwen3NextConfig(PretrainedConfig):
         self.output_router_logits = output_router_logits
         self.router_aux_loss_coef = router_aux_loss_coef
         self.mlp_only_layers = mlp_only_layers
+
+        # Token shifting (cannon layer): None | "cat" | "conv" @o2iginal
+        self.ffn_token_shift = ffn_token_shift
+        self.ffn_intermediate_token_shift = ffn_intermediate_token_shift
+        self.attn_token_shift = attn_token_shift
+        self.attn_q_token_shift = attn_q_token_shift
+        self.attn_k_token_shift = attn_k_token_shift
+        self.attn_v_token_shift = attn_v_token_shift
+        self.token_shift_conv_size = token_shift_conv_size
+        self.token_shift_conv_init = token_shift_conv_init
 
 
 __all__ = ["Qwen3NextConfig"]
