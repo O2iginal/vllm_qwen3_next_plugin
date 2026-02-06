@@ -272,6 +272,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                                                     1,
                                                     bias=False)
         else:
+            self.shared_expert = None
             self.shared_expert_gate = None
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
