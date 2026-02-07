@@ -218,8 +218,30 @@ class Qwen3NextConfig(PretrainedConfig):
         router_aux_loss_coef=0.001,
         mlp_only_layers=None,
         layer_types=None,
+        # Token shifting (cannon layer): None | "cat" | "conv" @gyzp
+        ffn_token_shift=None,
+        ffn_intermediate_token_shift=None,
+        attn_token_shift=None,
+        attn_q_token_shift=None,
+        attn_k_token_shift=None,
+        attn_v_token_shift=None,
+        token_shift_conv_size=4,
+        token_shift_conv_init="default",
+        # @gyzp attn/rnn RoPE toggles + attn logits scaling
+        attn_position_embedding_type="rope",
+        rnn_position_embedding_type="nope",
+        attn_logits_scaling=None,
+        attn_output_gate=False,
+        norm_type="rms",
+        attn_qk_norm=False,
         **kwargs,
     ):
+        assert attn_position_embedding_type in ("rope", "nope"), (
+            f"attn_position_embedding_type must be 'rope' or 'nope', got {attn_position_embedding_type}"
+        )
+        assert rnn_position_embedding_type in ("rope", "nope"), (
+            f"rnn_position_embedding_type must be 'rope' or 'nope', got {rnn_position_embedding_type}"
+        )
         if mlp_only_layers is None:
             mlp_only_layers = []
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
@@ -274,6 +296,24 @@ class Qwen3NextConfig(PretrainedConfig):
         self.output_router_logits = output_router_logits
         self.router_aux_loss_coef = router_aux_loss_coef
         self.mlp_only_layers = mlp_only_layers
+
+        # Token shifting (cannon layer) @gyzp
+        self.ffn_token_shift = ffn_token_shift
+        self.ffn_intermediate_token_shift = ffn_intermediate_token_shift
+        self.attn_token_shift = attn_token_shift
+        self.attn_q_token_shift = attn_q_token_shift
+        self.attn_k_token_shift = attn_k_token_shift
+        self.attn_v_token_shift = attn_v_token_shift
+        self.token_shift_conv_size = token_shift_conv_size
+        self.token_shift_conv_init = token_shift_conv_init
+
+        # @gyzp attn/rnn RoPE toggles and attn logits scaling
+        self.attn_position_embedding_type = attn_position_embedding_type
+        self.rnn_position_embedding_type = rnn_position_embedding_type
+        self.attn_logits_scaling = attn_logits_scaling
+        self.attn_output_gate = attn_output_gate
+        self.norm_type = norm_type
+        self.attn_qk_norm = attn_qk_norm
 
 
 __all__ = ["Qwen3NextConfig"]

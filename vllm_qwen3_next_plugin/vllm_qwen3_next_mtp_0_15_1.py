@@ -19,19 +19,19 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.qwen3_next import (
-    Qwen3NextDecoderLayer,
-    Qwen3NextRMSNorm,
-    QwenNextMixtureOfExperts,
-)
-from vllm.sequence import IntermediateTensors
-from vllm.transformers_utils.configs import Qwen3NextConfig
-
-from .utils import (
+from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
     maybe_prefix,
+)
+from vllm.sequence import IntermediateTensors
+from vllm.transformers_utils.configs import Qwen3NextConfig
+
+from .vllm_qwen3_next_0_15_1 import (
+    Qwen3NextDecoderLayer,
+    QwenNextMixtureOfExperts,
+    _get_qwen3_next_norm_cls,
 )
 
 logger = init_logger(__name__)
@@ -84,11 +84,10 @@ class Qwen3NextMultiTokenPredictor(nn.Module):
             ["hidden_states", "residual"], config.hidden_size
         )
 
-        self.norm = Qwen3NextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.pre_fc_norm_hidden = Qwen3NextRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-        self.pre_fc_norm_embedding = Qwen3NextRMSNorm(
+        _nc = _get_qwen3_next_norm_cls(config)
+        self.norm = _nc(config.hidden_size, eps=config.rms_norm_eps)
+        self.pre_fc_norm_hidden = _nc(config.hidden_size, eps=config.rms_norm_eps)
+        self.pre_fc_norm_embedding = _nc(
             config.hidden_size, eps=config.rms_norm_eps
         )
 

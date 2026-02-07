@@ -1,6 +1,6 @@
 # Qwen3-Next 自定义修改记录 (Custom Modifications)
 
-基于 vLLM 官方 Qwen3-Next 实现，按 [custom.md](custom.md) 中描述的顺序整理的修改清单，便于升级 vLLM 版本时复用到新代码。
+基于 vLLM 官方 Qwen3-Next 实现，进行自定义修改，按照修改顺序记录如下修改清单，便于升级 vLLM 版本时复用到新代码。
 
 涉及文件：
 - `vllm_qwen3_next_plugin/vllm_qwen3_next_0_11_0.py`（主模型，vLLM 0.11.0）
@@ -182,4 +182,11 @@
 | 7 Attn/RNN RoPE | 已加并校验 | 已实现；GDN 通过 gdn_positions 传位置（getattr/setattr 读写） | — |
 | 8 logits scaling | 已加 | 已实现 | — |
 
-以上按 [custom.md](custom.md) 顺序整理，便于逐条在新版本中复现与核对。
+
+# 版本适配记录
+
+## 0.11.0
+
+创建本 `CHANGELOG.md` 时，vLLM 版本为 0.11.0.
+
+## 0.15.1
