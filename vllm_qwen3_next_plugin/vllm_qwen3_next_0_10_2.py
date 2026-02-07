@@ -443,9 +443,14 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         positions: Optional[torch.Tensor] = None,  # @gyzp for RNN RoPE when rnn_position_embedding_type == "rope"
     ):
         # @gyzp pass positions into context so _forward can apply RNN RoPE
+        # ForwardContext is a dataclass (no .get/.setdefault); use dynamic attr
         if positions is not None:
             ctx = get_forward_context()
-            ctx.setdefault("gdn_positions", {})[self.prefix] = positions
+            gdn_positions = getattr(ctx, "gdn_positions", None)
+            if gdn_positions is None:
+                gdn_positions = {}
+                setattr(ctx, "gdn_positions", gdn_positions)
+            gdn_positions[self.prefix] = positions
         return torch.ops.vllm.gdn_attention(
             hidden_states,
             output,
@@ -568,8 +573,10 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             mixed_qkv_non_spec)
 
         # @gyzp apply RNN RoPE to q/k when rnn_position_embedding_type == "rope" (before recurrent)
-        positions = get_forward_context().get("gdn_positions", {}).get(
-            self.prefix)
+        # ForwardContext is a dataclass; use getattr to avoid AttributeError under Dynamo
+        gdn_positions = getattr(get_forward_context(), "gdn_positions", None)
+        positions = gdn_positions.get(self.prefix) if isinstance(
+            gdn_positions, dict) else None
         if self.rotary_emb is not None and positions is not None:
             if spec_token_masks is not None:
                 positions_spec = positions[spec_token_masks]
