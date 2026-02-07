@@ -42,8 +42,7 @@ from vllm.model_executor.layers.fused_moe import FusedMoE
 
 # yapf conflicts with isort for this block
 # yapf: disable
-from vllm.model_executor.layers.layernorm import (
-    RMSNorm as Qwen3NextRMSNorm) # @gyzp change from GemmaRMSNorm to RMSNorm
+from vllm.model_executor.layers.layernorm import RMSNorm, GemmaRMSNorm
 # yapf: enable
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -105,6 +104,14 @@ from vllm.model_executor.models.utils import (
 logger = init_logger(__name__)
 
 KVCache = tuple[torch.Tensor, torch.Tensor]
+
+
+def _get_qwen3_next_norm_cls(config):
+    """Return RMSNorm or GemmaRMSNorm by config.norm_type (default 'rms')."""
+    t = getattr(config, "norm_type", "rms")
+    if t in ("gemma_rms", "gemma"):
+        return GemmaRMSNorm
+    return RMSNorm
 
 
 def _apply_causal_depthwise_conv1d_bcl(
@@ -889,7 +896,7 @@ class Qwen3NextAttention(nn.Module):
         self.dual_chunk_attention_config = getattr(
             config, "dual_chunk_attention_config", None
         )
-        self.attn_output_gate = getattr(config, "attn_output_gate", True)
+        self.attn_output_gate = getattr(config, "attn_output_gate", False)
         # @gyzp optional attn RoPE (rope/nope) and logits scaling; getattr for backward compat
         self.attn_position_embedding_type = getattr(
             config, "attn_position_embedding_type", "rope"
@@ -906,9 +913,6 @@ class Qwen3NextAttention(nn.Module):
             prefix=f"{prefix}.qkv_proj",
         )
 
-        attention_bias = getattr(config, "attention_bias", "undefined")
-        print(f"[DEBUG] {[attention_bias]=}")
-
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             config.hidden_size,
@@ -916,6 +920,45 @@ class Qwen3NextAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
+
+        # @gyzp attn q/k/v token shift (cannon layer, conv mode)
+        kernel_size = getattr(config, "token_shift_conv_size", 4)
+        self.attn_q_token_shift = getattr(config, "attn_q_token_shift", None)
+        self.attn_k_token_shift = getattr(config, "attn_k_token_shift", None)
+        self.attn_v_token_shift = getattr(config, "attn_v_token_shift", None)
+        if self.attn_q_token_shift == "conv":
+            self.attn_q_token_shift_conv = nn.Conv1d(
+                self.q_size,
+                self.q_size,
+                kernel_size=kernel_size,
+                padding=0,
+                groups=self.q_size,
+                bias=False,
+            )
+        else:
+            self.attn_q_token_shift_conv = None
+        if self.attn_k_token_shift == "conv":
+            self.attn_k_token_shift_conv = nn.Conv1d(
+                self.kv_size,
+                self.kv_size,
+                kernel_size=kernel_size,
+                padding=0,
+                groups=self.kv_size,
+                bias=False,
+            )
+        else:
+            self.attn_k_token_shift_conv = None
+        if self.attn_v_token_shift == "conv":
+            self.attn_v_token_shift_conv = nn.Conv1d(
+                self.kv_size,
+                self.kv_size,
+                kernel_size=kernel_size,
+                padding=0,
+                groups=self.kv_size,
+                bias=False,
+            )
+        else:
+            self.attn_v_token_shift_conv = None
 
         # @gyzp only create RoPE when attn_position_embedding_type == "rope" (nope = no RoPE)
         self.rotary_emb = (
@@ -948,9 +991,15 @@ class Qwen3NextAttention(nn.Module):
             else {},
         )
 
-        # @gyzp disable qk norm
-        # self.q_norm = Qwen3NextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        # self.k_norm = Qwen3NextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        # @gyzp QK norm: default off, enable via config.attn_qk_norm
+        self.attn_qk_norm = getattr(config, "attn_qk_norm", False)
+        if self.attn_qk_norm:
+            _nc = _get_qwen3_next_norm_cls(config)
+            self.q_norm = _nc(self.head_dim, eps=config.rms_norm_eps)
+            self.k_norm = _nc(self.head_dim, eps=config.rms_norm_eps)
+        else:
+            self.q_norm = None
+            self.k_norm = None
 
     def forward(
         self,
@@ -972,17 +1021,41 @@ class Qwen3NextAttention(nn.Module):
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        # @gyzp disable qk norm
-        # q = self.q_norm(q.view(-1, self.num_heads, self.head_dim)).view(
-        #     -1, self.num_heads * self.head_dim)
-        # k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim)).view(
-        #     -1, self.num_kv_heads * self.head_dim)
-        q = q.view(-1, self.num_heads, self.head_dim).view(
-            -1, self.num_heads * self.head_dim
-        )
-        k = k.view(-1, self.num_kv_heads, self.head_dim).view(
-            -1, self.num_kv_heads * self.head_dim
-        )
+        # @gyzp attn q/k/v token shift (cannon layer, conv mode)
+        if self.attn_q_token_shift_conv is not None:
+            q_bcl = q.t().unsqueeze(0)
+            q_bcl = _apply_causal_depthwise_conv1d_bcl(
+                q_bcl, self.attn_q_token_shift_conv.weight
+            )
+            q = q_bcl.squeeze(0).t()
+        if self.attn_k_token_shift_conv is not None:
+            k_bcl = k.t().unsqueeze(0)
+            k_bcl = _apply_causal_depthwise_conv1d_bcl(
+                k_bcl, self.attn_k_token_shift_conv.weight
+            )
+            k = k_bcl.squeeze(0).t()
+        if self.attn_v_token_shift_conv is not None:
+            v_bcl = v.t().unsqueeze(0)
+            v_bcl = _apply_causal_depthwise_conv1d_bcl(
+                v_bcl, self.attn_v_token_shift_conv.weight
+            )
+            v = v_bcl.squeeze(0).t()
+
+        # @gyzp QK norm: apply when attn_qk_norm is True
+        if self.q_norm is not None and self.k_norm is not None:
+            q = self.q_norm(q.view(-1, self.num_heads, self.head_dim)).view(
+                -1, self.num_heads * self.head_dim
+            )
+            k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim)).view(
+                -1, self.num_kv_heads * self.head_dim
+            )
+        else:
+            q = q.view(-1, self.num_heads, self.head_dim).view(
+                -1, self.num_heads * self.head_dim
+            )
+            k = k.view(-1, self.num_kv_heads, self.head_dim).view(
+                -1, self.num_kv_heads * self.head_dim
+            )
 
         # @gyzp apply RoPE only when attn_position_embedding_type == "rope"
         if self.rotary_emb is not None:
@@ -1090,10 +1163,11 @@ class Qwen3NextDecoderLayer(nn.Module):
                 quant_config=quant_config,
             )
 
-        self.input_layernorm = Qwen3NextRMSNorm(
+        norm_cls = _get_qwen3_next_norm_cls(config)
+        self.input_layernorm = norm_cls(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.post_attention_layernorm = Qwen3NextRMSNorm(
+        self.post_attention_layernorm = norm_cls(
             config.hidden_size, eps=config.rms_norm_eps
         )
 
@@ -1226,7 +1300,8 @@ class Qwen3NextModel(nn.Module):
         )
 
         if get_pp_group().is_last_rank:
-            self.norm = Qwen3NextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            norm_cls = _get_qwen3_next_norm_cls(config)
+            self.norm = norm_cls(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
 

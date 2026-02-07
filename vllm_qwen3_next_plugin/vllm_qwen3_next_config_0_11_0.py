@@ -156,6 +156,13 @@ class Qwen3NextConfig(PretrainedConfig):
             Optional length-extrapolation scaling on query before attention. `None`: off.
             `float`: constant scale (q = q * scale). `"log"` or `"log <a>"`: position-dependent
             scale = log(position+a)/log(a) (a=362.0 if omitted).
+        attn_output_gate (`bool`, *optional*, defaults to `False`):  # @gyzp
+            Whether to use output gate in full-attention layers. When True, qkv_proj outputs
+            extra gate and attn_output is scaled by sigmoid(gate).
+        norm_type (`str`, *optional*, defaults to `"rms"`):  # @gyzp
+            Norm layer type: `"rms"` (standard RMSNorm) or `"gemma_rms"` (GemmaRMSNorm).
+        attn_qk_norm (`bool`, *optional*, defaults to `False`):  # @gyzp
+            Whether to apply RMSNorm to query and key in full-attention layers (QK norm). Default off.
 
     ```python
     >>> from transformers import Qwen3NextModel, Qwen3NextConfig
@@ -243,6 +250,9 @@ class Qwen3NextConfig(PretrainedConfig):
         attn_position_embedding_type="rope",
         rnn_position_embedding_type="nope",
         attn_logits_scaling=None,
+        attn_output_gate=False,
+        norm_type="rms",
+        attn_qk_norm=False,
         **kwargs,
     ):
         # @gyzp validate custom position embedding types
@@ -314,6 +324,9 @@ class Qwen3NextConfig(PretrainedConfig):
         self.attn_position_embedding_type = attn_position_embedding_type
         self.rnn_position_embedding_type = rnn_position_embedding_type
         self.attn_logits_scaling = attn_logits_scaling
+        self.attn_output_gate = attn_output_gate
+        self.norm_type = norm_type
+        self.attn_qk_norm = attn_qk_norm
 
 
 __all__ = ["Qwen3NextConfig"]
