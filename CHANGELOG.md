@@ -3,7 +3,8 @@
 基于 vLLM 官方 Qwen3-Next 实现，按 [custom.md](custom.md) 中描述的顺序整理的修改清单，便于升级 vLLM 版本时复用到新代码。
 
 涉及文件：
-- `vllm_qwen3_next_plugin/vllm_qwen3_next_0_11_0.py`（主模型）
+- `vllm_qwen3_next_plugin/vllm_qwen3_next_0_11_0.py`（主模型，vLLM 0.11.0）
+- `vllm_qwen3_next_plugin/vllm_qwen3_next_0_10_2.py`（主模型，vLLM 0.10.2，与 0_11_0 修改点对应）
 - `vllm_qwen3_next_plugin/vllm_qwen3_next_config_0_11_0.py`（Config）
 - `vllm_qwen3_next_plugin/vllm_qwen3_next_mtp_0_11_0.py`（MTP 多 token 预测）
 
@@ -19,11 +20,11 @@
   - 无新增字段；保证 `num_experts` 可设为 `0`（若上游有校验需放宽或跳过）。0_11_0 Config 中 `num_experts=512` 为默认，由调用方传入 0 即可。
 
 - **主模型 `vllm_qwen3_next_0_11_0.py`**  
-  - **DecoderLayer 选 MLP/MoE**（约 1071–1091 行）：条件为 `(self.layer_idx not in mlp_only_layers) and (config.num_experts > 0 and (self.layer_idx + 1) % config.decoder_sparse_step == 0)` 时才用 `Qwen3NextSparseMoeBlock`；否则若 `use_mlp_token_shift` 用 `Qwen3NextMLPWithTokenShift`，否则用 `Qwen3NextMLP`。即 **必须** `num_experts > 0` 才会建 MoE 层。  
-  - **Qwen3Next 主类**（约 1436–1469 行）：若 `config.num_experts == 0`，不遍历 `model.layers` 找 MoE，直接设 `num_moe_layers = 0` 以及 `num_expert_groups`、`num_shared_experts`、`num_logical_experts`、`num_physical_experts`、`num_local_physical_experts`、`num_routed_experts`、`num_redundant_experts` 均为 0。  
-  - **set_eplb_state**（约 1477–1478 行）：若 `config.num_experts == 0` 则直接 `return`。  
-  - **update_physical_experts_metadata**（约 1495–1496 行）：若 `config.num_experts == 0` 则直接 `return`。  
-  - **load_weights**：通过 `get_expert_mapping()` 获取 expert 映射；`get_expert_mapping()`（约 1269–1271 行）在 `config.num_experts == 0` 时返回空列表 `[]`，故 MoE 相关权重加载自然被跳过。
+  - **DecoderLayer 选 MLP/MoE**：条件为 `(self.layer_idx not in mlp_only_layers) and (config.num_experts > 0 and (self.layer_idx + 1) % config.decoder_sparse_step == 0)` 时才用 `Qwen3NextSparseMoeBlock`；否则若 `use_mlp_token_shift` 用 `Qwen3NextMLPWithTokenShift`，否则用 `Qwen3NextMLP`。即 **必须** `num_experts > 0` 才会建 MoE 层。  
+  - **Qwen3Next 主类**：若 `config.num_experts == 0`，不遍历 `model.layers` 找 MoE，直接设 `num_moe_layers = 0` 以及 `num_expert_groups`、`num_shared_experts`、`num_logical_experts`、`num_physical_experts`、`num_local_physical_experts`、`num_routed_experts`、`num_redundant_experts` 均为 0。  
+  - **set_eplb_state**：若 `config.num_experts == 0` 则直接 `return`。  
+  - **update_physical_experts_metadata**：若 `config.num_experts == 0` 则直接 `return`。  
+  - **load_weights**：通过 `get_expert_mapping()` 获取 expert 映射；`get_expert_mapping()` 在 `config.num_experts == 0` 时返回空列表 `[]`，故 MoE 相关权重加载自然被跳过。
 
 复用时在新版本中保留上述 `num_experts == 0` 分支与默认值设置即可。
 
@@ -109,12 +110,12 @@
 **修改要点**：
 
 - **Config（0_11_0）**  
-  - 已增加（约 236–246、306–314 行）：`ffn_token_shift`, `ffn_intermediate_token_shift`, `attn_token_shift`, `attn_q_token_shift`, `attn_k_token_shift`, `attn_v_token_shift`（均为 `None` | `"cat"` | `"conv"`），`token_shift_conv_size=4`, `token_shift_conv_init="default"`。
+  - 已增加：`ffn_token_shift`, `ffn_intermediate_token_shift`, `attn_token_shift`, `attn_q_token_shift`, `attn_k_token_shift`, `attn_v_token_shift`（均为 `None` | `"cat"` | `"conv"`），`token_shift_conv_size=4`, `token_shift_conv_init="default"`。
 
 - **主模型 0_11_0 实际实现**  
-  - **工具函数**（约 108–126 行）：`_apply_causal_depthwise_conv1d_bcl(x_bcl, weight_c1w)`，用 `F.pad` + `F.conv1d`，无状态、因果，便于 torch.compile。  
-  - **MLP**：`Qwen3NextMLPWithTokenShift`（约 135–219 行）：入口与 down_proj 前（intermediate 上）可选 conv token shift；`ffn_token_shift`/`ffn_intermediate_token_shift == "conv"` 时注册对应 `nn.Conv1d`，forward 中调用 `_apply_causal_depthwise_conv1d_bcl`。DecoderLayer 在 `use_mlp_token_shift` 为 True 时选用此类（约 1079–1083 行）。  
-  - **MoE**：`Qwen3NextSparseMoeBlock`（约 281–324 行）根据 `ffn_token_shift == "conv"` 注册 `token_shift_conv`，forward 入口对输入做一次因果 depthwise conv。  
+  - **工具函数**：`_apply_causal_depthwise_conv1d_bcl(x_bcl, weight_c1w)`，用 `F.pad` + `F.conv1d`，无状态、因果，便于 torch.compile。  
+  - **MLP**：`Qwen3NextMLPWithTokenShift`：入口与 down_proj 前（intermediate 上）可选 conv token shift；`ffn_token_shift`/`ffn_intermediate_token_shift == "conv"` 时注册对应 `nn.Conv1d`，forward 中调用 `_apply_causal_depthwise_conv1d_bcl`。DecoderLayer 在 `use_mlp_token_shift` 为 True 时选用此类。  
+  - **MoE**：`Qwen3NextSparseMoeBlock` 根据 `ffn_token_shift == "conv"` 注册 `token_shift_conv`，forward 入口对输入做一次因果 depthwise conv。  
   - **Attention 入口**：`Qwen3NextDecoderLayer` 在调用 `self_attn` 前，若 `attn_token_shift == "conv"`，对 `hidden_states` 做一次因果 depthwise conv 再送入 attention。  
   - **Q/K/V 单独 shift**：`Qwen3NextAttention` 中按 `attn_q_token_shift` / `attn_k_token_shift` / `attn_v_token_shift == "conv"` 注册对应 Conv1d，在 forward 中 split 出 q/k/v 后、RoPE 前对 q、k、v 分别做 `_apply_causal_depthwise_conv1d_bcl`。
 
@@ -132,13 +133,13 @@
   - 已增加（约 154–161、246–248、314–316 行）：`attn_position_embedding_type="rope"`, `rnn_position_embedding_type="nope"`；`__init__` 中 assert 仅允许 `"rope"` 或 `"nope"`（约 254–259 行）。
 
 - **主模型 0_11_0 实现**  
-  - **Qwen3NextAttention**（约 893–931、987–989 行）：`self.attn_position_embedding_type = getattr(config, "attn_position_embedding_type", "rope")`；仅当 `== "rope"` 时创建 `self.rotary_emb`，否则 `None`；forward 中仅当 `self.rotary_emb is not None` 时对 q,k 应用 RoPE。  
-  - **Qwen3NextGatedDeltaNet**：  
-    - `self.rnn_position_embedding_type = getattr(config, "rnn_position_embedding_type", "nope")`（约 425–426 行）；仅当 `== "rope"` 时创建 `self.rotary_emb`（约 429–437 行）。  
-    - **positions 传递**：`forward(hidden_states, output, positions=None)`（约 602–618 行）中，若 `positions is not None` 则 `get_forward_context().setdefault("gdn_positions", {})[self.prefix] = positions`，再调用 `torch.ops.vllm.gdn_attention`；在 `_forward` 内（约 731 行）通过 `positions = get_forward_context().get("gdn_positions", {}).get(self.prefix)` 读取，在 recurrent 前对 q/k 应用 RoPE（约 730–745 行）。  
-  - **Qwen3NextDecoderLayer**（约 1143–1146 行）：调用 `self.linear_attn(hidden_states=..., output=..., positions=positions)`，将 positions 传入 GDN。
+  - **Qwen3NextAttention**：`self.attn_position_embedding_type = getattr(config, "attn_position_embedding_type", "rope")`；仅当 `== "rope"` 时创建 `self.rotary_emb`，否则 `None`；forward 中仅当 `self.rotary_emb is not None` 时对 q,k 应用 RoPE。  
+  - **Qwen3NextGatedDeltaNet**：
+    - `self.rnn_position_embedding_type = getattr(config, "rnn_position_embedding_type", "nope")`；仅当 `== "rope"` 时创建 `self.rotary_emb`。  
+    - **positions 传递**：`forward(hidden_states, output, positions=None)` 中，若 `positions is not None` 则通过 `setattr`/`getattr` 在 context 上动态读写 `gdn_positions`（ForwardContext 为 dataclass，用 getattr/setattr 读写，避免 .get/.setdefault 以兼容 Dynamo 编译），再调用 `torch.ops.vllm.gdn_attention`；在 `_forward` 内读取并应用 RoPE 至 q、k 后再进入 recurrent。  
+  - **Qwen3NextDecoderLayer**：调用 `self.linear_attn(hidden_states=..., output=..., positions=positions)`，将 positions 传入 GDN。
 
-复用时在新版中定位 Attention 与 GDN 的 RoPE 创建与调用处，改为按上述两个 config 分别分支；并保证 GDN 的 positions 通过 forward 参数传入、在 GDN 内写入/读取 `gdn_positions` 的方式一致。
+复用时在新版中定位 Attention 与 GDN 的 RoPE 创建与调用处，改为按上述两个 config 分别分支；GDN 的 positions 通过 forward 参数传入，在 GDN 内用 **getattr/setattr 在 ForwardContext 上读写 `gdn_positions`**（勿用 `.get`/`.setdefault`，因 ForwardContext 为 dataclass）。
 
 ---
 
@@ -149,9 +150,9 @@
 **修改要点**：
 
 - **Config（0_11_0）**  
-  - 已增加（约 158–161、248 行）：`attn_logits_scaling=None`。含义：`None` 不缩放；`float` 常数缩放 `q = q * scale`；`str` 如 `"log"` 或 `"log <a>"` 表示 `scale = log(position+a)/log(a)`，`a` 缺省 362.0。
+  - 已增加：`attn_logits_scaling=None`。含义：`None` 不缩放；`float` 常数缩放 `q = q * scale`；`str` 如 `"log"` 或 `"log <a>"` 表示 `scale = log(position+a)/log(a)`，`a` 缺省 362.0。
 
-- **主模型 `Qwen3NextAttention`**（约 897、991–1001 行）  
+- **主模型 `Qwen3NextAttention`**  
   - `self.attn_logits_scaling = getattr(config, "attn_logits_scaling", None)`。  
   - 在应用 RoPE 之后、`self.attn(q, k, v)` 之前：若为 int/float 则 `q = q * self.attn_logits_scaling`；若为 str 则 `parts = self.attn_logits_scaling.split()`，`a = float(parts[1]) if len(parts) > 1 else 362.0`，`scale = (torch.log(pos_f + a) / math.log(a)).unsqueeze(-1)`，`q = q * scale`。  
   - 然后执行 `attn_output = self.attn(q, k, v)`。
@@ -163,6 +164,8 @@
 ## 其他注意事项
 
 - **Config 默认值**：升级 vLLM 后请对照本 CHANGELOG 与 `vllm_qwen3_next_config_0_11_0.py` 的 `__init__` 默认值，避免遗漏或冲突。
+- **0_10_2 与 0_11_0**：上述修改在 `vllm_qwen3_next_0_10_2.py` 中均有对应实现，复用时两处需同步更新（尤其 GDN positions 传递、Token shift、RoPE 等）。
+- **ForwardContext**：vLLM 的 `ForwardContext` 为 dataclass，无 `.get`/`.setdefault`；自定义字段请用 `getattr`/`setattr` 读写，否则在 Dynamo 编译下会触发 AttributeError。
 
 ---
 
@@ -176,7 +179,7 @@
 | 4 Norm | norm_type="rms" | 主模型与 MTP 均按 _get_qwen3_next_norm_cls(config) | — |
 | 5 QK Norm | attn_qk_norm=False | 默认关闭；True 时创建并应用 q_norm/k_norm | — |
 | 6 Token shift | 已加全部字段 | 已实现 ffn/attn 入口、MoE 入口、**attn q/k/v 分别 shift** | — |
-| 7 Attn/RNN RoPE | 已加并校验 | 已实现；GDN 通过 gdn_positions 传 positions | — |
+| 7 Attn/RNN RoPE | 已加并校验 | 已实现；GDN 通过 gdn_positions 传位置（getattr/setattr 读写） | — |
 | 8 logits scaling | 已加 | 已实现 | — |
 
 以上按 [custom.md](custom.md) 顺序整理，便于逐条在新版本中复现与核对。
