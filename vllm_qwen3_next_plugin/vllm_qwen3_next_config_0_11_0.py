@@ -1,4 +1,4 @@
-# dup from vllm/transformers_utils/configs/qwen3_next.py @o2iginal
+# dup from vllm/transformers_utils/configs/qwen3_next.py @gyzp
 
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
@@ -149,6 +149,14 @@ class Qwen3NextConfig(PretrainedConfig):
             If `mlp_only_layers` is empty, `decoder_sparse_step` is used to determine the sparsity.
         layer_types (`list[str]`, *optional*):
             Types of each layer (attention or linear).
+        attn_position_embedding_type (`str`, *optional*, defaults to `"rope"`):  # @gyzp
+            Position embedding for **full-attention** layers: `"rope"` or `"nope"`.
+        rnn_position_embedding_type (`str`, *optional*, defaults to `"nope"`):  # @gyzp
+            Position embedding for **linear/RNN** layers (GatedDeltaNet): `"rope"` or `"nope"`.
+        attn_logits_scaling (`float`, `str`, or `None`, *optional*, defaults to `None`):  # @gyzp
+            Optional length-extrapolation scaling on query before attention. `None`: off.
+            `float`: constant scale (q = q * scale). `"log"` or `"log <a>"`: position-dependent
+            scale = log(position+a)/log(a) (a=362.0 if omitted).
 
     ```python
     >>> from transformers import Qwen3NextModel, Qwen3NextConfig
@@ -223,7 +231,7 @@ class Qwen3NextConfig(PretrainedConfig):
         router_aux_loss_coef=0.001,
         mlp_only_layers=None,
         layer_types=None,
-        # Token shifting (cannon layer): None | "cat" | "conv" @o2iginal
+        # Token shifting (cannon layer): None | "cat" | "conv" @gyzp
         ffn_token_shift=None,
         ffn_intermediate_token_shift=None,
         attn_token_shift=None,
@@ -232,8 +240,19 @@ class Qwen3NextConfig(PretrainedConfig):
         attn_v_token_shift=None,
         token_shift_conv_size=4,
         token_shift_conv_init="default",
+        # @gyzp attn/rnn RoPE toggles + attn logits scaling (backward compat: defaults = rope, nope, None)
+        attn_position_embedding_type="rope",
+        rnn_position_embedding_type="nope",
+        attn_logits_scaling=None,
         **kwargs,
     ):
+        # @gyzp validate custom position embedding types
+        assert attn_position_embedding_type in ("rope", "nope"), (
+            f"attn_position_embedding_type must be 'rope' or 'nope', got {attn_position_embedding_type}"
+        )
+        assert rnn_position_embedding_type in ("rope", "nope"), (
+            f"rnn_position_embedding_type must be 'rope' or 'nope', got {rnn_position_embedding_type}"
+        )
         if mlp_only_layers is None:
             mlp_only_layers = []
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
@@ -282,7 +301,7 @@ class Qwen3NextConfig(PretrainedConfig):
         self.router_aux_loss_coef = router_aux_loss_coef
         self.mlp_only_layers = mlp_only_layers
 
-        # Token shifting (cannon layer): None | "cat" | "conv" @o2iginal
+        # Token shifting (cannon layer): None | "cat" | "conv" @gyzp
         self.ffn_token_shift = ffn_token_shift
         self.ffn_intermediate_token_shift = ffn_intermediate_token_shift
         self.attn_token_shift = attn_token_shift
@@ -291,6 +310,11 @@ class Qwen3NextConfig(PretrainedConfig):
         self.attn_v_token_shift = attn_v_token_shift
         self.token_shift_conv_size = token_shift_conv_size
         self.token_shift_conv_init = token_shift_conv_init
+
+        # @gyzp store attn/rnn RoPE toggles and attn logits scaling
+        self.attn_position_embedding_type = attn_position_embedding_type
+        self.rnn_position_embedding_type = rnn_position_embedding_type
+        self.attn_logits_scaling = attn_logits_scaling
 
 
 __all__ = ["Qwen3NextConfig"]

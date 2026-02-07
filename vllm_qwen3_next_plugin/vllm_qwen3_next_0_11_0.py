@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3Next model."""
+import math
 import os
 from collections.abc import Iterable
 from itertools import islice
@@ -240,7 +241,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                                      quant_config=quant_config,
                                      prefix=f"{prefix}.gate")
 
-        # Token shift at MoE entry (cannon layer, reuses ffn_token_shift) @o2iginal
+        # Token shift at MoE entry (cannon layer, reuses ffn_token_shift) @gyzp
         self.ffn_token_shift = getattr(config, "ffn_token_shift", None)
         kernel_size = getattr(config, "token_shift_conv_size", 4)
         if self.ffn_token_shift == "conv":
@@ -281,7 +282,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        # Token shift at MoE entry (cannon layer, conv mode) @o2iginal
+        # Token shift at MoE entry (cannon layer, conv mode) @gyzp
         if self.ffn_token_shift == "conv" and self.token_shift_conv is not None:
             x_bcl = hidden_states.t().unsqueeze(0)
             x_bcl = _apply_causal_depthwise_conv1d_bcl(
@@ -371,6 +372,19 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         self.speculative_config = speculative_config
         self.num_spec = (self.speculative_config.num_speculative_tokens
                          if self.speculative_config else 0)
+        # @gyzp optional RNN/GDN RoPE (rope/nope); getattr for backward compat, default nope
+        self.rnn_position_embedding_type = getattr(
+            config, "rnn_position_embedding_type", "nope")
+        self.rotary_emb = None
+        if self.rnn_position_embedding_type == "rope":
+            self.rotary_emb = get_rope(
+                head_size=self.head_k_dim,
+                rotary_dim=self.head_k_dim,
+                max_position=config.max_position_embeddings,
+                base=config.rope_theta,
+                rope_scaling=getattr(config, "rope_scaling", None),
+                partial_rotary_factor=getattr(config, "partial_rotary_factor", 0.25),
+            )
 
         # QKV
         self.conv_dim = self.key_dim * 2 + self.value_dim
@@ -529,7 +543,12 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         self,
         hidden_states: torch.Tensor,
         output: torch.Tensor,
+        positions: Optional[torch.Tensor] = None,  # @gyzp for RNN RoPE when rnn_position_embedding_type == "rope"
     ):
+        # @gyzp pass positions into context so _forward can apply RNN RoPE
+        if positions is not None:
+            ctx = get_forward_context()
+            ctx.setdefault("gdn_positions", {})[self.prefix] = positions
         return torch.ops.vllm.gdn_attention(
             hidden_states,
             output,
@@ -643,6 +662,23 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             mixed_qkv_spec)
         query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(
             mixed_qkv_non_spec)
+
+        # @gyzp apply RNN RoPE to q/k when rnn_position_embedding_type == "rope" (before recurrent)
+        positions = get_forward_context().get("gdn_positions", {}).get(
+            self.prefix)
+        if self.rotary_emb is not None and positions is not None:
+            if spec_token_masks is not None:
+                positions_spec = positions[spec_token_masks]
+                positions_non_spec = positions[~spec_token_masks]
+            else:
+                positions_spec = None
+                positions_non_spec = positions
+            if query_spec is not None and positions_spec is not None:
+                query_spec, key_spec = self.rotary_emb(
+                    positions_spec, query_spec, key_spec)
+            if query_non_spec is not None and positions_non_spec is not None:
+                query_non_spec, key_non_spec = self.rotary_emb(
+                    positions_non_spec, query_non_spec, key_non_spec)
 
         beta = b.sigmoid()
         # g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
@@ -791,6 +827,10 @@ class Qwen3NextAttention(nn.Module):
         self.dual_chunk_attention_config = getattr(
             config, "dual_chunk_attention_config", None)
         self.attn_output_gate = getattr(config, "attn_output_gate", True)
+        # @gyzp optional attn RoPE (rope/nope) and logits scaling; getattr for backward compat
+        self.attn_position_embedding_type = getattr(
+            config, "attn_position_embedding_type", "rope")
+        self.attn_logits_scaling = getattr(config, "attn_logits_scaling", None)
 
         self.qkv_proj = QKVParallelLinear(
             config.hidden_size,
@@ -813,14 +853,19 @@ class Qwen3NextAttention(nn.Module):
             prefix=f"{prefix}.o_proj",
         )
 
-        self.rotary_emb = get_rope(
-            head_size=self.head_dim,
-            rotary_dim=self.head_dim,
-            max_position=config.max_position_embeddings,
-            base=config.rope_theta,
-            rope_scaling=config.rope_scaling,
-            partial_rotary_factor=config.partial_rotary_factor,
-            dual_chunk_attention_config=self.dual_chunk_attention_config,
+        # @gyzp only create RoPE when attn_position_embedding_type == "rope" (nope = no RoPE)
+        self.rotary_emb = (
+            get_rope(
+                head_size=self.head_dim,
+                rotary_dim=self.head_dim,
+                max_position=config.max_position_embeddings,
+                base=config.rope_theta,
+                rope_scaling=config.rope_scaling,
+                partial_rotary_factor=config.partial_rotary_factor,
+                dual_chunk_attention_config=self.dual_chunk_attention_config,
+            )
+            if self.attn_position_embedding_type == "rope"
+            else None
         )
 
         self.attn = Attention(
@@ -870,7 +915,20 @@ class Qwen3NextAttention(nn.Module):
         q = q.view(-1, self.num_heads, self.head_dim).view(-1, self.num_heads * self.head_dim)
         k = k.view(-1, self.num_kv_heads, self.head_dim).view(-1, self.num_kv_heads * self.head_dim)
 
-        q, k = self.rotary_emb(positions, q, k)
+        # @gyzp apply RoPE only when attn_position_embedding_type == "rope"
+        if self.rotary_emb is not None:
+            q, k = self.rotary_emb(positions, q, k)
+
+        # @gyzp optional attn logits scaling (float const or "log"/"log <a>") before attention
+        if self.attn_logits_scaling is not None:
+            if isinstance(self.attn_logits_scaling, (int, float)):
+                q = q * self.attn_logits_scaling
+            elif isinstance(self.attn_logits_scaling, str):
+                parts = self.attn_logits_scaling.split()
+                a = float(parts[1]) if len(parts) > 1 else 362.0
+                pos_f = positions.to(device=q.device, dtype=q.dtype)
+                scale = (torch.log(pos_f + a) / math.log(a)).unsqueeze(-1)
+                q = q * scale
 
         attn_output = self.attn(q, k, v)
 
@@ -919,7 +977,7 @@ class Qwen3NextDecoderLayer(nn.Module):
         else:
             raise ValueError(f"Invalid layer_type {self.layer_type}")
 
-        # Attn token shift (cannon layer) before attention @o2iginal
+        # Attn token shift (cannon layer) before attention @gyzp
         self.attn_token_shift = getattr(config, "attn_token_shift", None)
         kernel_size = getattr(config, "token_shift_conv_size", 4)
         if self.attn_token_shift == "conv":
@@ -997,7 +1055,7 @@ class Qwen3NextDecoderLayer(nn.Module):
             hidden_states, residual = self.input_layernorm(
                 hidden_states, residual)
 
-        # Attn token shift (cannon layer, conv mode) before attention @o2iginal
+        # Attn token shift (cannon layer, conv mode) before attention @gyzp
         if (
             self.attn_token_shift == "conv"
             and self.attn_token_shift_conv is not None
@@ -1011,9 +1069,11 @@ class Qwen3NextDecoderLayer(nn.Module):
 
         self_attention_output = torch.empty_like(hidden_states)
         if self.layer_type == "linear_attention":
+            # @gyzp pass positions for GDN RNN RoPE when rnn_position_embedding_type == "rope"
             self.linear_attn(
                 hidden_states=hidden_states,
                 output=self_attention_output,
+                positions=positions,
             )
         elif self.layer_type == "full_attention":
             self.self_attn(

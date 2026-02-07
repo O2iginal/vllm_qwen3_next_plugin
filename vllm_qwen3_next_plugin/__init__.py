@@ -22,7 +22,7 @@ __all__ = ['Qwen3NextForCausalLM', 'register']
 def register():
     from vllm import ModelRegistry
     import vllm
-    # Register plugin Qwen3NextConfig so token-shift (cannon layer) config is loaded. @o2iginal
+    # Register plugin Qwen3NextConfig so token-shift (cannon layer) config is loaded. @gyzp
     # _CONFIG_REGISTRY expects string keys; lookup does getattr(configs, value). So we inject
     # our class into the configs module under "Qwen3NextConfig" instead of replacing the registry.
     import vllm.transformers_utils.configs as vllm_configs_module
