@@ -19,7 +19,6 @@
 """Qwen3-Next model configuration"""
 
 from transformers.configuration_utils import PretrainedConfig, layer_type_validation
-from transformers.modeling_rope_utils import rope_config_validation
 from transformers.utils import logging
 
 logger = logging.get_logger(__name__)
@@ -68,13 +67,12 @@ class Qwen3NextConfig(PretrainedConfig):
             relevant if `config.is_decoder=True`.
         tie_word_embeddings (`bool`, *optional*, defaults to `False`):
             Whether the model's input and output word embeddings should be tied.
-        rope_theta (`float`, *optional*, defaults to 10000.0):
-            The base period of the RoPE embeddings.
-        rope_scaling (`Dict`, *optional*):
+        rope_parameters (`dict`, *optional*):
             Dictionary containing the scaling configuration for the RoPE embeddings. NOTE: if you apply new rope type
             and you expect the model to work on longer `max_position_embeddings`, we recommend you to update this value
             accordingly.
             Expected contents:
+                `rope_theta` (`float`): The base period of the RoPE embeddings.
                 `rope_type` (`str`):
                     The sub-variant of RoPE to use. Can be one of ['default', 'linear', 'dynamic', 'yarn', 'longrope',
                     'llama3'], with 'default' being the original RoPE implementation.
@@ -107,8 +105,8 @@ class Qwen3NextConfig(PretrainedConfig):
                     Only used with 'llama3'. Scaling factor applied to low frequency components of the RoPE
                 `high_freq_factor` (`float`, *optional*):
                     Only used with 'llama3'. Scaling factor applied to high frequency components of the RoPE
-        partial_rotary_factor (`float`, *optional*, defaults to 0.25):
-            Percentage of the query and keys which will have rotary embedding.
+                `partial_rotary_factor` (`float`, *optional*, defaults to 0.25):
+                    Percentage of the query and keys which will have rotary embedding.
         attention_bias (`bool`, *optional*, defaults to `False`):
             Whether to use a bias in the query, key, value and output projection layers during self-attention.
         attention_dropout (`float`, *optional*, defaults to 0.0):
@@ -148,21 +146,6 @@ class Qwen3NextConfig(PretrainedConfig):
             If `mlp_only_layers` is empty, `decoder_sparse_step` is used to determine the sparsity.
         layer_types (`list[str]`, *optional*):
             Types of each layer (attention or linear).
-        attn_position_embedding_type (`str`, *optional*, defaults to `"rope"`):  # @gyzp
-            Position embedding for **full-attention** layers: `"rope"` or `"nope"`.
-        rnn_position_embedding_type (`str`, *optional*, defaults to `"nope"`):  # @gyzp
-            Position embedding for **linear/RNN** layers (GatedDeltaNet): `"rope"` or `"nope"`.
-        attn_logits_scaling (`float`, `str`, or `None`, *optional*, defaults to `None`):  # @gyzp
-            Optional length-extrapolation scaling on query before attention. `None`: off.
-            `float`: constant scale (q = q * scale). `"log"` or `"log <a>"`: position-dependent
-            scale = log(position+a)/log(a) (a=362.0 if omitted).
-        attn_output_gate (`bool`, *optional*, defaults to `False`):  # @gyzp
-            Whether to use output gate in full-attention layers. When True, qkv_proj outputs
-            extra gate and attn_output is scaled by sigmoid(gate).
-        norm_type (`str`, *optional*, defaults to `"rms"`):  # @gyzp
-            Norm layer type: `"rms"` (standard RMSNorm) or `"gemma_rms"` (GemmaRMSNorm).
-        attn_qk_norm (`bool`, *optional*, defaults to `False`):  # @gyzp
-            Whether to apply RMSNorm to query and key in full-attention layers (QK norm). Default off.
 
     ```python
     >>> from transformers import Qwen3NextModel, Qwen3NextConfig
@@ -216,9 +199,7 @@ class Qwen3NextConfig(PretrainedConfig):
         rms_norm_eps=1e-6,
         use_cache=True,
         tie_word_embeddings=False,
-        rope_theta=10000.0,
-        rope_scaling=None,
-        partial_rotary_factor=0.25,
+        rope_parameters=None,
         attention_bias=False,
         attention_dropout=0.0,
         head_dim=256,
@@ -246,7 +227,7 @@ class Qwen3NextConfig(PretrainedConfig):
         attn_v_token_shift=None,
         token_shift_conv_size=4,
         token_shift_conv_init="default",
-        # @gyzp attn/rnn RoPE toggles + attn logits scaling (backward compat: defaults = rope, nope, None)
+        # @gyzp attn/rnn RoPE toggles + attn logits scaling
         attn_position_embedding_type="rope",
         rnn_position_embedding_type="nope",
         attn_logits_scaling=None,
@@ -255,7 +236,6 @@ class Qwen3NextConfig(PretrainedConfig):
         attn_qk_norm=False,
         **kwargs,
     ):
-        # @gyzp validate custom position embedding types
         assert attn_position_embedding_type in ("rope", "nope"), (
             f"attn_position_embedding_type must be 'rope' or 'nope', got {attn_position_embedding_type}"
         )
@@ -276,13 +256,20 @@ class Qwen3NextConfig(PretrainedConfig):
         self.initializer_range = initializer_range
         self.rms_norm_eps = rms_norm_eps
         self.use_cache = use_cache
-        self.rope_theta = rope_theta
-        self.rope_scaling = rope_scaling
+        # Try to set `rope_scaling` if available, otherwise use `rope_parameters`
+        rope_scaling = kwargs.pop("rope_scaling", None)
+        rope_parameters = rope_scaling or rope_parameters or {"rope_type": "default"}
+        rope_theta = kwargs.pop("rope_theta", 10000.0)
+        if "rope_theta" not in rope_parameters:
+            rope_parameters["rope_theta"] = rope_theta
+        partial_rotary_factor = kwargs.pop("partial_rotary_factor", 0.25)
+        if "partial_rotary_factor" not in rope_parameters:
+            rope_parameters["partial_rotary_factor"] = partial_rotary_factor
+        self.rope_parameters = rope_parameters
         self.partial_rotary_factor = partial_rotary_factor
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
         self.head_dim = head_dim
-        rope_config_validation(self)
 
         self.layer_types = layer_types
         if self.layer_types is None:
@@ -310,7 +297,7 @@ class Qwen3NextConfig(PretrainedConfig):
         self.router_aux_loss_coef = router_aux_loss_coef
         self.mlp_only_layers = mlp_only_layers
 
-        # Token shifting (cannon layer): None | "cat" | "conv" @gyzp
+        # Token shifting (cannon layer) @gyzp
         self.ffn_token_shift = ffn_token_shift
         self.ffn_intermediate_token_shift = ffn_intermediate_token_shift
         self.attn_token_shift = attn_token_shift
@@ -320,7 +307,7 @@ class Qwen3NextConfig(PretrainedConfig):
         self.token_shift_conv_size = token_shift_conv_size
         self.token_shift_conv_init = token_shift_conv_init
 
-        # @gyzp store attn/rnn RoPE toggles and attn logits scaling
+        # @gyzp attn/rnn RoPE toggles and attn logits scaling
         self.attn_position_embedding_type = attn_position_embedding_type
         self.rnn_position_embedding_type = rnn_position_embedding_type
         self.attn_logits_scaling = attn_logits_scaling
