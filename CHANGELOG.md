@@ -161,6 +161,29 @@
 
 ---
 
+## 9. GatedRMSNorm（norm_type="gated_rms"）
+
+**意图**：在 decoder 的 input_layernorm / post_attention_layernorm（及最终 norm）上支持 GatedRMSNorm：先 RMSNorm，再经低秩门控 `gate = sigmoid(W_up(swish(W_down(y)))) * gate_scale`，输出 `gate * y`。与 HF modeling 中 `Qwen3NextGatedRMSNorm` 及训练侧 GatedRMSNorm 对齐，便于加载转换后的 gated_rms 权重。GDN 内部 norm 仍为普通 RMS，不受 norm_type 影响。
+
+**修改要点**：
+
+- **Config（0_15_1）**  
+  - `norm_type` 增加可选值 `"gated_rms"`（`"rms"` | `"gemma_rms"` | `"gated_rms"`），并增加 `gated_norm_rank=16`、`gated_norm_gate_scale=1.0`，写入 `self.gated_norm_rank`、`self.gated_norm_gate_scale`。  
+  - `__init__` 中对 `norm_type` 做 assert，仅允许上述三值。
+
+- **主模型 `vllm_qwen3_next_0_15_1.py`**  
+  - 新增 `GatedRMSNorm` 类：内部为 `RMSNorm` + `nn.Linear` 的 `w_down`（hidden_size -> rank）、`w_up`（rank -> hidden_size），零初始化；forward 为 `y = rms_norm(x)`，`gate = sigmoid(w_up(swish(w_down(y)))) * gate_scale`，`return gate * y`。  
+  - 支持与现有 norm 一致的 fused residual 调用：`forward(x, residual=None)`，当 `residual is not None` 时返回 `(out, residual)`，否则仅返回 `out`。  
+  - `_get_qwen3_next_norm_cls(config)`：当 `config.norm_type == "gated_rms"` 时返回一工厂函数 `_factory(hidden_size, eps)`，内部根据 `config.gated_norm_rank`、`config.gated_norm_gate_scale` 构造并返回 `GatedRMSNorm` 实例；其余与 custom 4 相同，仍返回 RMSNorm / GemmaRMSNorm 类。  
+  - `input_layernorm`、`post_attention_layernorm`、最终 `norm` 的构造方式不变，仍为 `_nc(config.hidden_size, eps=config.rms_norm_eps)`，故对 gated_rms 会得到 `GatedRMSNorm` 实例。
+
+- **权重加载**  
+  - HF 转换后权重名为 `input_layernorm.rms_norm.weight`、`input_layernorm.w_down.weight`、`input_layernorm.w_up.weight`（及 post_attention_layernorm、norm 的对应 key），与 `GatedRMSNorm` 的 `named_parameters()` 一致，无需额外 remap。
+
+复用时在新版中保留 `GatedRMSNorm` 类、`_get_qwen3_next_norm_cls` 对 `gated_rms` 的分支及 config 三字段即可。
+
+---
+
 ## 其他注意事项
 
 - **Config 默认值**：升级 vLLM 后请对照本 CHANGELOG 与 `vllm_qwen3_next_config_0_11_0.py` 的 `__init__` 默认值，避免遗漏或冲突。
@@ -181,6 +204,7 @@
 | 6 Token shift | 已加全部字段 | 已实现 ffn/attn 入口、MoE 入口、**attn q/k/v 分别 shift** | — |
 | 7 Attn/RNN RoPE | 已加并校验 | 已实现；GDN 通过 gdn_positions 传位置（getattr/setattr 读写） | — |
 | 8 logits scaling | 已加 | 已实现 | — |
+| 9 GatedRMSNorm | norm_type 支持 gated_rms；gated_norm_rank / gated_norm_gate_scale | GatedRMSNorm 类 + _get_qwen3_next_norm_cls 工厂 | 0_11_0 / 0_15_1 |
 
 
 # 版本适配记录

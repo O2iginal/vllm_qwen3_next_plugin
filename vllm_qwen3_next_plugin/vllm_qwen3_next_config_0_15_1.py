@@ -233,6 +233,8 @@ class Qwen3NextConfig(PretrainedConfig):
         attn_logits_scaling=None,
         attn_output_gate=False,
         norm_type="rms",
+        gated_norm_rank=16,
+        gated_norm_gate_scale=1.0,
         attn_qk_norm=False,
         **kwargs,
     ):
@@ -241,6 +243,9 @@ class Qwen3NextConfig(PretrainedConfig):
         )
         assert rnn_position_embedding_type in ("rope", "nope"), (
             f"rnn_position_embedding_type must be 'rope' or 'nope', got {rnn_position_embedding_type}"
+        )
+        assert norm_type in ("rms", "gemma_rms", "gated_rms"), (
+            f"norm_type must be 'rms', 'gemma_rms', or 'gated_rms', got {norm_type!r}"
         )
         if mlp_only_layers is None:
             mlp_only_layers = []
@@ -313,6 +318,8 @@ class Qwen3NextConfig(PretrainedConfig):
         self.attn_logits_scaling = attn_logits_scaling
         self.attn_output_gate = attn_output_gate
         self.norm_type = norm_type
+        self.gated_norm_rank = gated_norm_rank
+        self.gated_norm_gate_scale = gated_norm_gate_scale
         self.attn_qk_norm = attn_qk_norm
 
 

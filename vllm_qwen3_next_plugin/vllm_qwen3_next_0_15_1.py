@@ -108,11 +108,70 @@ logger = init_logger(__name__)
 KVCache = tuple[torch.Tensor, torch.Tensor]
 
 
+class GatedRMSNorm(nn.Module):
+    """
+    RMSNorm followed by element-wise gating (low-rank self-gating).
+    Forward: y = RMSNorm(x); gate = sigmoid(W_up(swish(W_down(y)))) * gate_scale; return gate * y.
+    Supports fused residual path: forward(x, residual) -> (out, residual).
+    TODO optimize this using triton in the future.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-6,
+        rank: int = 16,
+        gate_scale: float = 1.0,
+    ) -> None:
+        super().__init__()
+        self.rms_norm = RMSNorm(hidden_size, eps=eps)
+        self.w_down = nn.Linear(hidden_size, rank, bias=False)
+        self.w_up = nn.Linear(rank, hidden_size, bias=False)
+        self.gate_scale = gate_scale
+        self._init_gate_weights()
+
+    def _init_gate_weights(self) -> None:
+        nn.init.zeros_(self.w_down.weight)
+        nn.init.zeros_(self.w_up.weight)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        # Fuse residual add like vLLM RMSNorm: norm(x + residual), return (out, x+residual).
+        if residual is not None:
+            x = x + residual
+            residual = x
+        y = self.rms_norm(x)
+        down = self.w_down(y)
+        activated = down * torch.sigmoid(down)  # swish
+        up = self.w_up(activated)
+        gate = torch.sigmoid(up) * self.gate_scale
+        out = gate * y
+        if residual is not None:
+            return out, residual
+        return out
+
+
 def _get_qwen3_next_norm_cls(config):
-    """Return RMSNorm or GemmaRMSNorm by config.norm_type (default 'rms')."""
+    """Return RMSNorm, GemmaRMSNorm, or a factory for GatedRMSNorm by config.norm_type (default 'rms')."""
     t = getattr(config, "norm_type", "rms")
     if t in ("gemma_rms", "gemma"):
         return GemmaRMSNorm
+    if t == "gated_rms":
+        rank = getattr(config, "gated_norm_rank", 16)
+        gate_scale = getattr(config, "gated_norm_gate_scale", 1.0)
+
+        def _factory(hidden_size: int, eps: float = 1e-6) -> GatedRMSNorm:
+            return GatedRMSNorm(
+                hidden_size,
+                eps=eps,
+                rank=rank,
+                gate_scale=gate_scale,
+            )
+
+        return _factory
     return RMSNorm
 
 
@@ -1295,9 +1354,9 @@ class Qwen3NextModel(nn.Module):
             ["hidden_states", "residual"], config.hidden_size
         )
 
+        # Final norm: always RMSNorm so checkpoint model.norm.weight loads (HF uses LlamaRMSNorm for final norm).
         if get_pp_group().is_last_rank:
-            _nc = _get_qwen3_next_norm_cls(config)
-            self.norm = _nc(config.hidden_size, eps=config.rms_norm_eps)
+            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
 
