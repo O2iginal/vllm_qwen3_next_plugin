@@ -214,3 +214,49 @@
 创建本 `CHANGELOG.md` 时，vLLM 版本为 0.11.0.
 
 ## 0.15.1
+
+### 近期适配经验
+
+- `0.15.1` 服务级运行时曾出现 `float != bfloat16`
+  - 根因不是 checkpoint 本身，而是自定义模块直接使用了 checkpoint `config.dtype=float32`
+  - 修复原则：涉及真实运行时张量/模块 dtype 时，优先使用 `model_config.dtype`
+- `0.15.1` 的 `hybrid gdn + moe` 严格测试暴露出两个 MoE 语义问题
+  - `shared_expert_intermediate_size == 0` 时，不应无条件创建 `shared_expert_gate`
+  - `SharedFusedMoE` 返回值可能是 `(shared_out, fused_out)`，不能默认当单个 Tensor 使用
+- `0.18.1` 的第一层适配结论
+  - 不能直接 wrapper 到 `0.15.1`
+  - 必须先按 `0.18.1` 上游的真实 import path 重建 variant
+
+## 0.18.1
+
+### 近期适配经验
+
+- `0.18.1` clone 环境里若残留上游 `flash-attn`
+  - 即使 `vllm 0.18.1` 自带 `vllm.vllm_flash_attn`
+  - `rotary_embedding/common.py` 仍可能因为 `find_spec("flash_attn")` 命中残留包而误走坏路径
+  - 典型报错：
+    - `flash_attn_2_cuda ... undefined symbol`
+  - 当前有效处理方式：
+    - 在 `.venv-vllm0.18.1` 中直接 `uv pip uninstall flash-attn`
+- `0.18.1` quick checkpoint 若 `num_experts=0`
+  - `QwenNextMixtureOfExperts.set_moe_parameters()` 也必须保留无 MoE 早返回
+  - 否则会报：
+    - `RuntimeError: No Qwen3Next layer found in the model.layers.`
+- `0.18.1` 若出现“服务能起，但同 prompt 下输出语义明显偏离 `0.11/0.15`”
+  - 优先检查 `Qwen3NextGatedDeltaNet` 是否遗漏以下迁移：
+    - `rnn_position_embedding_type`
+    - GDN 自身 `rotary_emb`
+    - `forward_context.gdn_positions` 的写入
+    - `_forward_core()` 中对 spec / non-spec 分支的 rotary 应用
+    - `Qwen3NextDecoderLayer.forward()` 是否把 `positions` 传给 `linear_attn`
+  - 这些缺失会让 `0.18.1` quick checkpoint 在 `temperature=0` 下也出现明显异常输出
+- `0.18.1` 的最终 `norm`
+  - 为了与当前 checkpoint 路径和 `0.15.1` 行为保持一致
+  - 仍应固定为 `RMSNorm`
+  - 不要直接沿用上游 `Qwen3NextRMSNorm`
+- 当前 quick checkpoint 的同 prompt 对比已经确认：
+  - 修复前：`0.18.1` 在 `temperature=0` 下仍会返回明显异常编号 / 列表文本
+  - 修复后：`0.18.1` 与 `0.15.1` 在
+    - `temperature=0`
+    - `temperature=0.7`
+    的行为已对齐

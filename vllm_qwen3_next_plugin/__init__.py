@@ -1,23 +1,9 @@
 GREEN = "\033[32m"
 RESET = "\033[0m"
 
-# Module-level import for direct access to Qwen3NextForCausalLM
 try:
-    import vllm
-
-    vllm_version = vllm.__version__
-
-    if vllm_version.startswith("0.10.2"):
-        from .vllm_qwen3_next_0_10_2 import Qwen3NextForCausalLM
-    elif vllm_version.startswith("0.11.0"):
-        from .vllm_qwen3_next_0_11_0 import Qwen3NextForCausalLM
-    elif vllm_version.startswith("0.15"):
-        from .vllm_qwen3_next_0_15_1 import Qwen3NextForCausalLM
-    else:
-        # Default to 0.11.0 if version check fails
-        from .vllm_qwen3_next_0_11_0 import Qwen3NextForCausalLM
+    from .qwen3_next import Qwen3NextForCausalLM
 except ImportError:
-    # Fallback if vllm is not available
     from .vllm_qwen3_next_0_11_0 import Qwen3NextForCausalLM
 
 __all__ = ["Qwen3NextForCausalLM", "register"]
@@ -27,67 +13,24 @@ def register():
     from vllm import ModelRegistry
     import vllm
 
-    # Register plugin Qwen3NextConfig so token-shift (cannon layer) config is loaded. @gyzp
-    # _CONFIG_REGISTRY expects string keys; lookup does getattr(configs, value). So we inject
-    # our class into the configs module under "Qwen3NextConfig" instead of replacing the registry.
     import vllm.transformers_utils.configs as vllm_configs_module
+    from .config import Qwen3NextConfig as PluginQwen3NextConfig
+    from .mtp import Qwen3NextMTP
+    from .versioning import get_supported_version_key
+
     vllm_version = vllm.__version__
-    if vllm_version.startswith("0.15"):
-        from .vllm_qwen3_next_config_0_15_1 import Qwen3NextConfig as PluginQwen3NextConfig
-    else:
-        from .vllm_qwen3_next_config_0_11_0 import Qwen3NextConfig as PluginQwen3NextConfig
+    version_key = get_supported_version_key(vllm_version)
     vllm_configs_module.Qwen3NextConfig = PluginQwen3NextConfig
 
-    if vllm_version.startswith("0.10.2"):
-        from .vllm_qwen3_next_0_10_2 import Qwen3NextForCausalLM
-
-        print(
-            f"{GREEN}[vLLM Plugin] Loaded implementation for vLLM {vllm_version}{RESET}"
-        )
-        ModelRegistry.register_model("Qwen3NextForCausalLM", Qwen3NextForCausalLM)
-        print(
-            f"{GREEN}[vLLM Plugin] Registered Qwen3NextForCausalLM with custom support{RESET}"
-        )
-        from .vllm_qwen3_next_mtp_0_10_2 import Qwen3NextMTP
-        print(
-            f"{GREEN}[vLLM Plugin] Registered Qwen3NextMTP (v0.10.2) with custom support{RESET}"
-        )
-        ModelRegistry.register_model("Qwen3NextMTP", Qwen3NextMTP)
-    elif vllm_version.startswith("0.11.0"):
-        from .vllm_qwen3_next_0_11_0 import Qwen3NextForCausalLM
-
-        print(
-            f"{GREEN}[vLLM Plugin] Loaded implementation for vLLM {vllm_version}{RESET}"
-        )
-        ModelRegistry.register_model("Qwen3NextForCausalLM", Qwen3NextForCausalLM)
-        print(
-            f"{GREEN}[vLLM Plugin] Registered Qwen3NextForCausalLM with custom support{RESET}"
-        )
-        from .vllm_qwen3_next_mtp_0_11_0 import Qwen3NextMTP
-        print(
-            f"{GREEN}[vLLM Plugin] Registered Qwen3NextMTP (v0.11.0) with custom support{RESET}"
-        )
-        ModelRegistry.register_model("Qwen3NextMTP", Qwen3NextMTP)
-    elif vllm_version.startswith("0.15"):
-        from .vllm_qwen3_next_0_15_1 import Qwen3NextForCausalLM
-
-        print(
-            f"{GREEN}[vLLM Plugin] Loaded implementation for vLLM {vllm_version}{RESET}"
-        )
-        ModelRegistry.register_model("Qwen3NextForCausalLM", Qwen3NextForCausalLM)
-        print(
-            f"{GREEN}[vLLM Plugin] Registered Qwen3NextForCausalLM with custom support{RESET}"
-        )
-        from .vllm_qwen3_next_mtp_0_15_1 import Qwen3NextMTP
-        print(
-            f"{GREEN}[vLLM Plugin] Registered Qwen3NextMTP (v0.15.1) with custom support{RESET}"
-        )
-        ModelRegistry.register_model("Qwen3NextMTP", Qwen3NextMTP)
-    else:
-        raise ImportError(
-            f"Unsupported vLLM version: {vllm_version}. "
-            "Supported versions: 0.10.2, 0.11.0, 0.15.x"
-        )
+    print(f"{GREEN}[vLLM Plugin] Loaded implementation for vLLM {vllm_version}{RESET}")
+    ModelRegistry.register_model("Qwen3NextForCausalLM", Qwen3NextForCausalLM)
+    print(
+        f"{GREEN}[vLLM Plugin] Registered Qwen3NextForCausalLM with custom support{RESET}"
+    )
+    print(
+        f"{GREEN}[vLLM Plugin] Registered Qwen3NextMTP ({version_key}) with custom support{RESET}"
+    )
+    ModelRegistry.register_model("Qwen3NextMTP", Qwen3NextMTP)
 
     print(
         f"{GREEN}[vLLM Plugin] Enable this plugin by setting `os.environ['VLLM_PLUGINS'] = 'register_qwen3_next_model'` if this not working{RESET}"

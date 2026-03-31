@@ -7,7 +7,7 @@ name = "vllm_qwen3_next_plugin"
 version = "0.1"  
 description = "vLLM Qwen3Next model plugin with custom support (includes MTP support for v0.11.0)."
 dependencies = [
-    "vllm>=0.10.2,<=0.11.0"
+    "vllm>=0.11.0,<0.19"
 ]
 
 [project.entry-points."vllm.general_plugins"]  
