@@ -9,6 +9,7 @@
 - `0.15.1` 已通过更严格的 `hybrid gdn + moe` checkpoint 服务级验证
 - `0.18.1` 已完成 quick checkpoint 的真实服务级验证
 - `0.18.1 + hybrid gdn + moe` 已完成严格 `vllm serve` 启动与请求返回验证
+- `0.18.1 + hybrid gdn + MTP` 已完成插件侧 speculative decoding 兼容适配，当前开发分支为 `dev/gyzp_mtp`
 
 ## 当前已验证基线
 
@@ -19,6 +20,7 @@
 - 已验证能力：
   - 插件导入成功
   - `register()` 成功接管 `Qwen3NextForCausalLM`、`Qwen3NextMTP`、`Qwen3NextConfig`
+  - `register()` 会安装 Qwen3Next MTP speculative runtime patches
   - 能真实启动 `python -m vllm.entrypoints.openai.api_server`
   - 能对测试 checkpoint 返回可读自然语言
   - 能对更严格的 `hybrid gdn + moe` checkpoint 返回可读自然语言
@@ -37,6 +39,8 @@
 - cannon layer / token shift
 - attention 与 GDN 分离位置编码
 - attention logits scaling
+- MTP draft layers 使用全局 layer index，并按 `mtp_layer_types` 支持 full attention / linear attention 混排
+- vLLM speculative decoding 中对 Qwen3Next MTP draft attention layer names、metadata builder、attention group 做运行时兼容修补
 
 ## 重构目标
 
@@ -109,6 +113,25 @@ vllm serve /mnt/ssd/yulan/pretrain-linear-moe-dev-worktree/YuLan-Pretrain-gyzp_m
 - `0.15.1 + hybrid gdn + moe`：严格 `vllm serve` 路径已通过
 - `0.18.1`：quick checkpoint 的 `serve -> /health -> completion` 已通过
 - `0.18.1 + hybrid gdn + moe`：严格 `vllm serve` 路径已能启动并返回文本
+- `0.18.1 + hybrid gdn + MTP`：已支持 MTP checkpoint 的 draft model 加载、spec step 轮转、linear-attention draft layer attention metadata 兼容；对应分支 `dev/gyzp_mtp`
+
+## MTP speculative 适配要点
+
+当前 `dev/gyzp_mtp` 分支补齐了 vLLM `0.18.1` 上 Qwen3Next MTP 作为 draft model 时的关键兼容路径：
+
+- `vllm_qwen3_next_plugin/variants/mtp_vllm_0_18_1.py`
+  - `Qwen3NextMultiTokenPredictor.layers` 改为按全局 layer index 存储的 `ModuleDict`
+  - MTP layer index 从 `config.num_hidden_layers` 后继续编号，匹配 HF/MCore 转换后的权重命名
+  - 每个 MTP head 按 `config.mtp_layer_types[idx]` 选择 `full_attention` 或 `linear_attention`
+  - speculative step 通过 `_qwen3_next_mtp_spec_step_idx` 轮转到对应 MTP head
+- `vllm_qwen3_next_plugin/compat/speculative.py`
+  - 在 `register()` 阶段安装 runtime patches
+  - 对 Qwen3Next linear-attention MTP draft layers 补齐 `_draft_attn_layer_names`
+  - 为 draft linear-attention layer 找到正确 metadata builder
+  - 重建或切换 draft attention groups，避免 vLLM 只按 full-attention draft layer 组织 metadata
+- `0.11.0 / 0.15.1 / 0.18.1` 的 MTP variant 均已同步全局 layer index 与 `mtp_layer_types` 逻辑，便于后续版本对齐。
+
+注意：这部分是针对 Qwen3Next MTP speculative decoding 的插件兼容层，不等价于主模型普通 greedy/sampling 路径。普通非 MTP 推理仍走 `Qwen3NextForCausalLM` 主模型。
 
 ## 当前 `0.18.1` 排查结论
 

@@ -6,6 +6,8 @@ try:
 except ImportError:
     from .vllm_qwen3_next_0_11_0 import Qwen3NextForCausalLM
 
+from .compat.speculative import apply_runtime_patches
+
 __all__ = ["Qwen3NextForCausalLM", "register"]
 
 
@@ -21,6 +23,7 @@ def register():
     vllm_version = vllm.__version__
     version_key = get_supported_version_key(vllm_version)
     vllm_configs_module.Qwen3NextConfig = PluginQwen3NextConfig
+    apply_runtime_patches()
 
     print(f"{GREEN}[vLLM Plugin] Loaded implementation for vLLM {vllm_version}{RESET}")
     ModelRegistry.register_model("Qwen3NextForCausalLM", Qwen3NextForCausalLM)

@@ -1,5 +1,37 @@
 # vLLM Qwen3 Next Plugin 进度记录
 
+## 2026-05-18
+
+### Phase 16: Qwen3Next MTP speculative decoding 兼容
+
+- 当前工作分支：
+  - `dev/gyzp_mtp`
+- 本阶段目标：
+  - 支持转换后的 hybrid GDN MTP checkpoint 在 vLLM speculative decoding 路径中作为 draft model 运行
+  - 重点适配 `vllm 0.18.1`
+  - 同步保持 `0.11.0 / 0.15.1 / 0.18.1` 三套 MTP variant 的 layer index 和 layer type 语义一致
+- 已完成实现：
+  - `vllm_qwen3_next_plugin/__init__.py`
+    - `register()` 中新增 `apply_runtime_patches()` 调用
+  - `vllm_qwen3_next_plugin/compat/speculative.py`
+    - 新增 Qwen3Next MTP speculative runtime patches
+    - 自动识别 `model.layers.{num_hidden_layers + idx}` 形式的 draft layer names
+    - 为 linear-attention draft layer 补齐 metadata builder 和 attention group 兼容
+  - `vllm_qwen3_next_plugin/variants/mtp_vllm_0_11_0.py`
+  - `vllm_qwen3_next_plugin/variants/mtp_vllm_0_15_1.py`
+  - `vllm_qwen3_next_plugin/variants/mtp_vllm_0_18_1.py`
+    - MTP layers 改为全局 layer index
+    - 支持 `config.mtp_layer_types`
+    - 多 MTP head 按 speculative step 轮转
+    - 权重加载兼容全局 layer key
+- 已补充测试：
+  - `tests/test_speculative_compat.py`
+  - `tests/test_config_0_18_1_custom_fields.py`
+  - `tests/test_plugin_contract.py`
+- 与主仓 MTP 评测的关系：
+  - 主仓 `/workspace_mtp` 中的 vLLM MTP 吞吐和接受率评测依赖本分支的插件兼容层
+  - handoff 文档会记录本插件分支、关键文件和提交信息，供主线合并时追踪
+
 ## 2026-03-31
 
 ### Phase 0: 当前背景恢复

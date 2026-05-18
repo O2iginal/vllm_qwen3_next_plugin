@@ -72,14 +72,18 @@ class Qwen3NextMultiTokenPredictor(nn.Module):
             prefix=f"{prefix}.fc",
         )
 
-        self.layers = torch.nn.ModuleList(
-            Qwen3NextDecoderLayer(
+        self.layers = torch.nn.ModuleDict({
+            str(self.mtp_start_layer_idx + idx): Qwen3NextDecoderLayer(
                 vllm_config,
-                layer_type="full_attention",
-                prefix=f"{prefix}.layers.{idx}",
+                layer_type=(
+                    config.mtp_layer_types[idx]
+                    if getattr(config, "mtp_layer_types", None)
+                    else "full_attention"
+                ),
+                prefix=f"{prefix}.layers.{self.mtp_start_layer_idx + idx}",
             )
             for idx in range(self.num_mtp_layers)
-        )
+        })
 
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
@@ -119,8 +123,10 @@ class Qwen3NextMultiTokenPredictor(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        current_step_idx = spec_step_idx % self.num_mtp_layers
-        hidden_states, residual = self.layers[current_step_idx](
+        current_step_idx = self.mtp_start_layer_idx + (
+            spec_step_idx % self.num_mtp_layers
+        )
+        hidden_states, residual = self.layers[str(current_step_idx)](
             positions=positions,
             hidden_states=hidden_states,
             residual=residual,
@@ -269,8 +275,16 @@ class Qwen3NextMTP(nn.Module, QwenNextMixtureOfExperts):
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: object,
     ):
+        spec_step_idx = int(getattr(self, "_qwen3_next_mtp_spec_step_idx", 0))
+        if hasattr(self, "_qwen3_next_mtp_spec_step_idx"):
+            self._qwen3_next_mtp_spec_step_idx = spec_step_idx + 1
         hidden_states = self.model(
-            input_ids, positions, hidden_states, intermediate_tensors, inputs_embeds
+            input_ids,
+            positions,
+            hidden_states,
+            intermediate_tensors,
+            inputs_embeds,
+            spec_step_idx=spec_step_idx,
         )
         return hidden_states
 
@@ -288,6 +302,11 @@ class Qwen3NextMTP(nn.Module, QwenNextMixtureOfExperts):
             for name, weight in weights:
                 if name.startswith("mtp."):
                     name = name.replace("mtp.", "model.")
+                    for idx in range(self.model.num_mtp_layers):
+                        name = name.replace(
+                            f"model.layers.{idx}.",
+                            f"model.layers.{self.model.mtp_start_layer_idx + idx}.",
+                        )
                 elif not any(key in name for key in shared_weight_names):
                     continue
                 yield name, weight

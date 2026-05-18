@@ -2,6 +2,40 @@
 
 基于 vLLM 官方 Qwen3-Next 实现，进行自定义修改，按照修改顺序记录如下修改清单，便于升级 vLLM 版本时复用到新代码。
 
+## 2026-05-18 MTP speculative decoding 兼容
+
+本轮在 `dev/gyzp_mtp` 分支补齐 Qwen3Next MTP checkpoint 在 vLLM speculative decoding 路径下的兼容能力，重点面向 `vllm 0.18.1`，同时同步维护 `0.11.0 / 0.15.1` 的 MTP variant 结构。
+
+核心改动：
+
+- `register()` 现在会调用 `compat.speculative.apply_runtime_patches()`，在插件注册阶段安装 Qwen3Next MTP runtime patches。
+- `Qwen3NextMultiTokenPredictor.layers` 改为按全局 layer index 保存，MTP 第 0 层对应 `config.num_hidden_layers`，第 N 层对应 `config.num_hidden_layers + N`。
+- MTP block 类型不再固定为 full attention，而是按 `config.mtp_layer_types[idx]` 选择 `full_attention` 或 `linear_attention`。
+- speculative forward 通过 `_qwen3_next_mtp_spec_step_idx` 跟踪当前 draft step，使多 MTP head 能按 step 轮转执行。
+- 权重加载兼容转换后的全局 key：`model.layers.{num_hidden_layers + idx}.*` 映射回对应 MTP block。
+- 新增 `compat/speculative.py`：
+  - 自动识别 Qwen3Next MTP draft layer names
+  - 为 linear-attention MTP draft layer 查找 metadata builder
+  - 在 vLLM speculative proposer 初始化和 propose 阶段修正 draft attention layer names / attention groups
+  - 同时兼容 `0.18.x` 的 `_draft_attn_layer_names` 风格和早期版本的 `attn_layer_names` 风格
+
+新增/更新测试：
+
+- `tests/test_speculative_compat.py`
+  - 覆盖 MTP draft layer name 识别
+  - 覆盖 metadata builder 查找
+- `tests/test_config_0_18_1_custom_fields.py`
+  - 覆盖 `mtp_layer_types` 驱动的 MTP layer 构造
+  - 验证 MTP layer 使用全局 layer index
+- `tests/test_plugin_contract.py`
+  - 覆盖 `register()` 会安装 runtime patches
+
+复用注意事项：
+
+- HF/MCore 转换侧必须写出 `num_nextn_predict_layers` 和 `mtp_layer_types`，否则插件只能退回默认 full-attention MTP。
+- MTP 权重命名应与主模型连续编号，即 MTP block 落在 `model.layers.{num_hidden_layers + idx}`，不要再假设 `mtp.layers.{idx}` 是唯一加载入口。
+- 对含 linear-attention 的 MTP draft model，不能直接依赖 vLLM 默认 speculative metadata 构造；需要保留本兼容层，否则容易出现 draft layer names 缺失或 metadata builder 错配。
+
 涉及文件：
 - `vllm_qwen3_next_plugin/vllm_qwen3_next_0_11_0.py`（主模型，vLLM 0.11.0）
 - `vllm_qwen3_next_plugin/vllm_qwen3_next_0_10_2.py`（主模型，vLLM 0.10.2，与 0_11_0 修改点对应）
