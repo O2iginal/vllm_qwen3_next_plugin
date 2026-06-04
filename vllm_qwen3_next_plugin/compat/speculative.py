@@ -95,7 +95,9 @@ def apply_runtime_patches() -> None:
 
     original_load_model = EagleProposer.load_model
     original_propose = EagleProposer.propose
-    original_initialize_attn_backend = EagleProposer.initialize_attn_backend
+    original_initialize_attn_backend = getattr(
+        EagleProposer, "initialize_attn_backend", None
+    )
 
     def patched_load_model(self: Any, target_model: Any) -> None:
         target_mamba_layer_names = set(
@@ -166,69 +168,75 @@ def apply_runtime_patches() -> None:
                 attn_groups[0][0],
             )
 
-    def patched_initialize_attn_backend(
-        self: Any,
-        kv_cache_config: Any,
-        kernel_block_sizes: list[int] | None = None,
-    ) -> None:
-        if not _is_qwen3_next_linear_attention_mtp(self):
-            return original_initialize_attn_backend(
-                self, kv_cache_config, kernel_block_sizes
+    if original_initialize_attn_backend is not None:
+
+        def patched_initialize_attn_backend(
+            self: Any,
+            kv_cache_config: Any,
+            kernel_block_sizes: list[int] | None = None,
+        ) -> None:
+            if not _is_qwen3_next_linear_attention_mtp(self):
+                return original_initialize_attn_backend(
+                    self, kv_cache_config, kernel_block_sizes
+                )
+
+            all_attn_layers = get_layers_from_vllm_config(
+                self.vllm_config,
+                AttentionLayerBase,
             )
+            layer_to_group: dict[str, tuple[int, Any]] = {}
+            for gid, group in enumerate(kv_cache_config.kv_cache_groups):
+                for layer_name in group.layer_names:
+                    layer_to_group[layer_name] = (gid, group.kv_cache_spec)
 
-        all_attn_layers = get_layers_from_vllm_config(
-            self.vllm_config,
-            AttentionLayerBase,
-        )
-        layer_to_group: dict[str, tuple[int, Any]] = {}
-        for gid, group in enumerate(kv_cache_config.kv_cache_groups):
-            for layer_name in group.layer_names:
-                layer_to_group[layer_name] = (gid, group.kv_cache_spec)
+            attention_groups: dict[tuple[int, str], Any] = {}
+            for layer_name in sorted(self._draft_attn_layer_names, key=_layer_sort_key):
+                if layer_name not in layer_to_group:
+                    continue
+                gid, kv_cache_spec = layer_to_group[layer_name]
+                layer_kv_cache_spec = kv_cache_spec
+                if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
+                    layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[layer_name]
 
-        attention_groups: dict[tuple[int, str], Any] = {}
-        for layer_name in sorted(self._draft_attn_layer_names, key=_layer_sort_key):
-            if layer_name not in layer_to_group:
-                continue
-            gid, kv_cache_spec = layer_to_group[layer_name]
-            layer_kv_cache_spec = kv_cache_spec
-            if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
-                layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[layer_name]
+                attn_backend = all_attn_layers[layer_name].get_attn_backend()
+                backend_key = (gid, attn_backend.full_cls_name())
+                if backend_key not in attention_groups:
+                    kernel_block_size = (
+                        kernel_block_sizes[gid]
+                        if kernel_block_sizes is not None
+                        and gid < len(kernel_block_sizes)
+                        else None
+                    )
+                    attn_group = AttentionGroup(
+                        backend=attn_backend,
+                        layer_names=[layer_name],
+                        kv_cache_spec=layer_kv_cache_spec,
+                        kv_cache_group_id=gid,
+                    )
+                    attn_group.create_metadata_builders(
+                        self.vllm_config,
+                        self.device,
+                        kernel_block_size=kernel_block_size,
+                    )
+                    attention_groups[backend_key] = attn_group
+                else:
+                    attention_groups[backend_key].layer_names.append(layer_name)
 
-            attn_backend = all_attn_layers[layer_name].get_attn_backend()
-            backend_key = (gid, attn_backend.full_cls_name())
-            if backend_key not in attention_groups:
-                kernel_block_size = (
-                    kernel_block_sizes[gid]
-                    if kernel_block_sizes is not None and gid < len(kernel_block_sizes)
-                    else None
+            if not attention_groups:
+                return original_initialize_attn_backend(
+                    self, kv_cache_config, kernel_block_sizes
                 )
-                attn_group = AttentionGroup(
-                    backend=attn_backend,
-                    layer_names=[layer_name],
-                    kv_cache_spec=layer_kv_cache_spec,
-                    kv_cache_group_id=gid,
-                )
-                attn_group.create_metadata_builders(
-                    self.vllm_config,
-                    self.device,
-                    kernel_block_size=kernel_block_size,
-                )
-                attention_groups[backend_key] = attn_group
-            else:
-                attention_groups[backend_key].layer_names.append(layer_name)
 
-        if not attention_groups:
-            return original_initialize_attn_backend(
-                self, kv_cache_config, kernel_block_sizes
+            self.draft_attn_groups = list(attention_groups.values())
+            self.kv_cache_gid = self.draft_attn_groups[0].kv_cache_group_id
+            self.block_size = (
+                self.draft_attn_groups[0]
+                .get_metadata_builder()
+                .kv_cache_spec.block_size
             )
-
-        self.draft_attn_groups = list(attention_groups.values())
-        self.kv_cache_gid = self.draft_attn_groups[0].kv_cache_group_id
-        self.block_size = (
-            self.draft_attn_groups[0].get_metadata_builder().kv_cache_spec.block_size
-        )
 
     EagleProposer.load_model = patched_load_model
     EagleProposer.propose = patched_propose
-    EagleProposer.initialize_attn_backend = patched_initialize_attn_backend
+    if original_initialize_attn_backend is not None:
+        EagleProposer.initialize_attn_backend = patched_initialize_attn_backend
     EagleProposer._qwen3_next_plugin_patch_applied = True

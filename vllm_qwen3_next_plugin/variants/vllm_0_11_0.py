@@ -80,7 +80,7 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs import Qwen3NextConfig
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import HAS_TRITON, tl, triton
 from vllm.utils import direct_register_custom_op
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
@@ -712,7 +712,11 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         self_kv_cache = self.kv_cache[forward_context.virtual_engine]
         conv_state = self_kv_cache[0].transpose(-1, -2)
         ssm_state = self_kv_cache[1]
-        num_actual_tokens = attn_metadata.num_actual_tokens
+        num_actual_tokens = (
+            attn_metadata.num_prefill_tokens
+            + attn_metadata.num_decode_tokens
+            + attn_metadata.num_spec_decode_tokens
+        )
         num_accepted_tokens = attn_metadata.num_accepted_tokens
         if spec_token_masks is not None:
             spec_token_masks = spec_token_masks[:num_actual_tokens]
@@ -775,7 +779,6 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 has_initial_state=has_initial_state,
                 cache_indices=non_spec_state_indices_tensor,
                 query_start_loc=non_spec_query_start_loc,
-                metadata=attn_metadata,
             ).transpose(0, 1)
         elif attn_metadata.num_decodes > 0:
             mixed_qkv_non_spec = causal_conv1d_update(
@@ -1227,6 +1230,7 @@ class Qwen3NextDecoderLayer(nn.Module):
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
+                prefix=f"{prefix}.mlp",
             )
 
         norm_cls = _get_qwen3_next_norm_cls(config)
@@ -1748,32 +1752,36 @@ direct_register_custom_op(
 
 
 # g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
-@triton.jit
-def fused_gdn_gating_kernel(
-    g,
-    A_log,
-    a,
-    dt_bias,
-    seq_len,
-    NUM_HEADS: tl.constexpr,
-    beta: tl.constexpr,
-    threshold: tl.constexpr,
-    BLK_HEADS: tl.constexpr,
-):
-    i_b, i_s, i_d = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    head_off = i_d * BLK_HEADS + tl.arange(0, BLK_HEADS)
-    off = i_b * seq_len * NUM_HEADS + i_s * NUM_HEADS + head_off
-    mask = head_off < NUM_HEADS
-    blk_A_log = tl.load(A_log + head_off, mask=mask)
-    blk_a = tl.load(a + off, mask=mask)
-    blk_bias = tl.load(dt_bias + head_off, mask=mask)
-    # If the model is loaded in fp16, without the .float() here, A might be -inf
-    x = blk_a.to(tl.float32) + blk_bias.to(tl.float32)
-    softplus_x = tl.where(
-        beta * x <= threshold, (1 / beta) * tl.log(1 + tl.exp(beta * x)), x
-    )
-    blk_g = -tl.exp(blk_A_log.to(tl.float32)) * softplus_x
-    tl.store(g + off, blk_g.to(g.dtype.element_ty), mask=mask)
+if HAS_TRITON:
+
+    @triton.jit
+    def fused_gdn_gating_kernel(
+        g,
+        A_log,
+        a,
+        dt_bias,
+        seq_len,
+        NUM_HEADS: tl.constexpr,
+        beta: tl.constexpr,
+        threshold: tl.constexpr,
+        BLK_HEADS: tl.constexpr,
+    ):
+        i_b, i_s, i_d = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+        head_off = i_d * BLK_HEADS + tl.arange(0, BLK_HEADS)
+        off = i_b * seq_len * NUM_HEADS + i_s * NUM_HEADS + head_off
+        mask = head_off < NUM_HEADS
+        blk_A_log = tl.load(A_log + head_off, mask=mask)
+        blk_a = tl.load(a + off, mask=mask)
+        blk_bias = tl.load(dt_bias + head_off, mask=mask)
+        # If the model is loaded in fp16, without the .float() here, A might be -inf
+        x = blk_a.to(tl.float32) + blk_bias.to(tl.float32)
+        softplus_x = tl.where(
+            beta * x <= threshold, (1 / beta) * tl.log(1 + tl.exp(beta * x)), x
+        )
+        blk_g = -tl.exp(blk_A_log.to(tl.float32)) * softplus_x
+        tl.store(g + off, blk_g.to(g.dtype.element_ty), mask=mask)
+else:
+    fused_gdn_gating_kernel = None
 
 
 def fused_gdn_gating(
@@ -1783,6 +1791,13 @@ def fused_gdn_gating(
     beta: float = 1.0,
     threshold: float = 20.0,
 ) -> torch.Tensor:
+    if fused_gdn_gating_kernel is None:
+        return -A_log.float().exp() * F.softplus(
+            a.float() + dt_bias.float(),
+            beta=beta,
+            threshold=threshold,
+        )
+
     batch, num_heads = a.shape
     seq_len = 1
     grid = (batch, seq_len, triton.cdiv(num_heads, 8))
