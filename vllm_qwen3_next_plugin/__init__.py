@@ -3,10 +3,15 @@ RESET = "\033[0m"
 
 from .compat.speculative import apply_runtime_patches
 from .compat.ascend import (
+    ensure_ascend_custom_ops_registered,
+    patch_ascend_attention_direct_call_trace_flag,
+    patch_ascend_gdn_hd64_runtime_workarounds,
     patch_ascend_qwen3_next_registration,
+    patch_ascend_torch_decode_attention,
     patch_gdn_aclgraph_support,
     patch_plugin_causal_conv1d_ops,
     patch_plugin_fla_ops,
+    patch_plugin_qwen3_next_attention,
     patch_triton_placeholder_math_symbols,
 )
 
@@ -15,12 +20,23 @@ __all__ = ["Qwen3NextForCausalLM", "register"]
 
 def __getattr__(name: str):
     if name == "Qwen3NextForCausalLM":
+        import vllm
+
+        from .versioning import get_supported_version_key
+
         patch_triton_placeholder_math_symbols()
         patch_gdn_aclgraph_support()
+        patch_ascend_attention_direct_call_trace_flag()
+        patch_ascend_torch_decode_attention()
+        ensure_ascend_custom_ops_registered()
+        patch_ascend_gdn_hd64_runtime_workarounds()
         from .qwen3_next import Qwen3NextForCausalLM
 
-        patch_plugin_causal_conv1d_ops(Qwen3NextForCausalLM)
-        patch_plugin_fla_ops(Qwen3NextForCausalLM)
+        version_key = get_supported_version_key(vllm.__version__)
+        patch_plugin_qwen3_next_attention(Qwen3NextForCausalLM)
+        if version_key != "vllm_0_20_2":
+            patch_plugin_causal_conv1d_ops(Qwen3NextForCausalLM)
+            patch_plugin_fla_ops(Qwen3NextForCausalLM)
         return Qwen3NextForCausalLM
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
@@ -31,6 +47,10 @@ def register():
 
     patch_triton_placeholder_math_symbols()
     patch_gdn_aclgraph_support()
+    patch_ascend_attention_direct_call_trace_flag()
+    patch_ascend_torch_decode_attention()
+    ensure_ascend_custom_ops_registered()
+    patch_ascend_gdn_hd64_runtime_workarounds()
 
     import vllm.transformers_utils.configs as vllm_configs_module
     from .config import Qwen3NextConfig as PluginQwen3NextConfig
@@ -42,8 +62,10 @@ def register():
     version_key = get_supported_version_key(vllm_version)
     vllm_configs_module.Qwen3NextConfig = PluginQwen3NextConfig
     apply_runtime_patches()
-    patch_plugin_causal_conv1d_ops(Qwen3NextForCausalLM)
-    patch_plugin_fla_ops(Qwen3NextForCausalLM)
+    patch_plugin_qwen3_next_attention(Qwen3NextForCausalLM)
+    if version_key != "vllm_0_20_2":
+        patch_plugin_causal_conv1d_ops(Qwen3NextForCausalLM)
+        patch_plugin_fla_ops(Qwen3NextForCausalLM)
     patch_ascend_qwen3_next_registration(Qwen3NextForCausalLM, Qwen3NextMTP)
 
     print(f"{GREEN}[vLLM Plugin] Loaded implementation for vLLM {vllm_version}{RESET}")

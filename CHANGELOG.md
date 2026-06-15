@@ -2,6 +2,51 @@
 
 基于 vLLM 官方 Qwen3-Next 实现，进行自定义修改，按照修改顺序记录如下修改清单，便于升级 vLLM 版本时复用到新代码。
 
+## 2026-06-15 vLLM 0.20.2 / CANN9 trusted hybrid GDN plugin 统一
+
+本轮开始把此前已在 CANN9 runtime 中验证的 trusted hybrid GDN 修复统一迁入 plugin，目标是不再依赖手工 patch `site-packages`。当前结构和注册路径已迁入，hd64 GDN decode 仍在服务级验证中。
+
+核心改动：
+
+- `variants/vllm_0_20_2.py`
+  - 新增 `_block_rms_norm_cls(config)`：`rms_norm_add_unit_offset=False` 时使用普通 `RMSNorm(w)`；缺省仍保持官方 Gemma-style RMSNorm。
+  - QKV bias 支持 `attention_bias` fallback。
+  - `enable_qk_norm=False` 时不创建/应用 q_norm/k_norm。
+  - `num_experts=0` dense 模型不再在 `set_moe_parameters()` 中报错，MoE metadata 计数置零。
+- `compat/ascend.py`
+  - 新增 `ensure_ascend_custom_ops_registered()`，在插件模型构造前显式注册 vLLM-Ascend OOT ops，确保 `GatedDeltaNetAttention` 实例化为 `AscendGatedDeltaNetAttention`。
+  - 新增 `patch_ascend_gdn_hd64_runtime_workarounds()`。
+  - head_dim<128 GDN prefill 在 vLLM-Ascend `chunk_gated_delta_rule_fwd` 中 pad K/Q/W/U/state 到 128，走 triton h/o kernel 后 slice 回真实维度。
+  - head_dim<128 GDN decode fallback 仍在调试；官方 128-dim fast path 不受影响。
+  - 可用 `VLLM_QWEN3_NEXT_DISABLE_GDN_HD64_FIX=1` 关闭 workaround 做对照。
+- `__init__.py`
+  - `register()` 和 lazy model import 都会自动安装 hd64 GDN Ascend workaround。
+
+使用方式：
+
+```bash
+PYTHONPATH=/path/to/vllm_qwen3_next_plugin:${PYTHONPATH} \
+VLLM_PLUGINS=ascend,register_qwen3_next_model \
+vllm serve /path/to/trusted-hybrid-gdn \
+  --trust-remote-code \
+  --hf-overrides '{"rms_norm_add_unit_offset": false}'
+```
+
+注意：不要覆盖原始 `PYTHONPATH`，否则 CANN9 `acl` 模块不会传入 EngineCore spawn 子进程。
+
+验证目标：
+
+- `/health` 正常。
+- `The capital of Japan is` 返回可读 Tokyo 段落。
+- Janet GSM8K prompt 返回 `$18`。
+
+当前状态：
+
+- 静态测试已通过：`39 passed`
+- OOT registry 已确认命中 `vllm_ascend.ops.gdn.AscendGatedDeltaNetAttention`
+- 服务级 GSM8K 长 decode 尚未通过，不能宣布完成。
+- OpenCompass GSM8K full run 可实际向 vLLM 发起请求，但吞吐异常低：metrics 中 `num_requests_running` 可达十几个、`num_requests_waiting=0`，同时 NPU AICore 约 `0-1%`、`VLLM::EngineCore` CPU 占用较高。该现象表明当前瓶颈不是单纯 `max_num_seqs`、`max_num_batched_tokens`、OpenCompass `WORKERS` 或 `batch_size` 不足，而是 head_dim<128 GDN decode 仍可能走 `_torch_recurrent_gated_delta_rule_decode` 的 Python/torch fallback。后续需要将该 decode fallback 收敛为 NPU fast path 或批量化实现。
+
 ## 2026-05-18 MTP speculative decoding 兼容
 
 本轮在 `dev/gyzp_mtp` 分支补齐 Qwen3Next MTP checkpoint 在 vLLM speculative decoding 路径下的兼容能力，重点面向 `vllm 0.18.1`，同时同步维护 `0.11.0 / 0.15.1` 的 MTP variant 结构。

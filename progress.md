@@ -173,6 +173,57 @@
 - 这一步仍然保住了当前 `0.11.0` 的轻量回归基线
 - 下一阶段可以开始真正把旧实现向 `variants/` 和 `upstream/` 迁移
 
+## 2026-06-15 Phase: CANN9 + vLLM 0.20.2 trusted hybrid GDN + OpenCompass 评测效率
+
+### 背景
+- 环境升级到 CANN 9.0.0 后，旧 vLLM 0.11 栈（triton-ascend 3.2.0）完全不可用（NPU 驱动扩展编译失败，RT_LIMIT 枚举改名）。
+- 新建可复现 CANN9 栈（`venv-vllm-ascend-cann9-py311`）：vllm 0.20.2+empty + vllm-ascend 0.20.2rc1 + torch-npu 2.10 + triton-ascend 3.2.1。
+- 官方 Qwen3-Next-80B-A3B 在 native 0.20.2 直接可用（serve + 生成正确，decode/prefill gate pass）。
+- 主线目标 checkpoint：trusted HF hybrid GDN（num_experts=0、dense、GDN head_dim=64、49 GDN layers + 7 full-attn、attention_bias=True、enable_qk_norm=False）。
+
+### 迁入 plugin 的核心修复（已落地到 variants + compat）
+- `variants/vllm_0_20_2.py`：`_block_rms_norm_cls(config)`（按 `rms_norm_add_unit_offset` 选 plain RMSNorm 或 GemmaRMSNorm）、`attention_bias` fallback、enable_qk_norm 条件构造、num_experts=0 dense 静默处理。
+- `compat/ascend.py` + `__init__.py`：
+  - `ensure_ascend_custom_ops_registered()` 保障 GatedDeltaNetAttention 走 Ascend OOT。
+  - `patch_ascend_gdn_hd64_runtime_workarounds()`：
+    - prefill：head_dim<128 时 pad K/Q/W/U/state 到 128，走同包 triton chunk_delta_h / chunk_fwd_o，再 slice 回（绕过 AscendC + 原 triton hd=64 跨 chunk state carry 问题）。
+    - decode：hd<128 强制关闭 `enable_packed_recurrent_decode`（GatedDeltaNetAttention 层 + AscendGatedDeltaNetAttention 层 guard），回退普通 recurrent branch；128 官方路径不受影响。
+  - 注册在 `register()` 和模型 lazy import 时自动安装。
+- 使用要求（关键）：`PYTHONPATH=/path/to/vllm_qwen3_next_plugin:${PYTHONPATH}`（不能覆盖原值，否则 acl 模块丢失） + `VLLM_PLUGINS=ascend,register_qwen3_next_model` + `--hf-overrides '{"rms_norm_add_unit_offset": false}'`。
+- 控制：`VLLM_QWEN3_NEXT_DISABLE_GDN_HD64_FIX=1` 可关闭全部 workaround 做对照。
+
+### 验证结果（正确性）
+- 静态：`pytest tests/test_ascend_static.py tests/test_versioning.py -q` → 39 passed。
+- 服务级（trusted hybrid GDN）：
+  - `/health` 200，模型正确加载（无 q_norm/k_norm 报错、无 MoE 报错）。
+  - 短 prompt（"The capital of Japan is" 等）连贯输出，与 native HF 对齐。
+  - Janet GSM8K（完整 prompt，temp=0）：完整 Step 推理 + 最终 `$18`（与 0.11 venv native HF 基线一致）。
+- 三大历史阻断（RMSNorm 公式、prefill 跨 chunk state、packed decode handoff）全部在 plugin 路径解决。
+
+### 当前开放项（效率阶段）
+- OpenCompass GSM8K full run：请求能正常下发（num_requests_running 可观），但 NPU AICore 利用率 ~0-1%，EngineCore CPU 高，吞吐极低。
+- 根因：正确性 workaround 后，hd=64 GDN decode 落到 `_torch_recurrent_gated_delta_rule_decode` 等纯 Python/torch fallback（CPU-bound），而非 NPU fast path。
+- 不是 batch_size / max_num_seqs / OpenCompass worker 能简单调出来的问题。
+- 下一步优先：在 `compat/ascend.py` 把 hd<128 decode 收敛到高效 NPU 路径或可批量化的 torch 实现，再重跑 OpenCompass 吞吐 + 准确率。
+- 详细 profile / 隔离实验 / 老师 forcing 比对历史见 `/mnt/yulan-pretrain/gaoyanzipeng/progress.md`（含 gdn_op_isolate.py、gdn_stage_probe.py、teacher-force 逐位比对等工具）。
+
+### 阶段产物（本次整理入库）
+- `vllm_qwen3_next_plugin/upstream/vllm_0_20_2/`（上游 modeling/config 快照）
+- `vllm_qwen3_next_plugin/variants/*_vllm_0_20_2.py`（结构差异）
+- `vllm_qwen3_next_plugin/compat/ascend.py`（Ascend 运行时 workaround）
+- `docs/superpowers/plans/2026-06-15-vllm-0-20-2-hybrid-gdn-plugin.md` + spec
+- 更新 `README.md`、`CHANGELOG.md`、`progress.md`（本文）、测试。
+
+**验收底线（本次 commit 前已达）**：插件路径可启动真实 trusted hybrid GDN serve 并返回正确自然语言（含 GSM8K 数学题）。OpenCompass 批量评测效率是下一阶段主线。
+
+### 目录清理（本次 commit 附带）
+- 清理 `__pycache__`、`.egg-info`、`.pytest_cache`。
+- kernel_meta/ 临时编译缓存已从工作区移除并加入 .gitignore（AscendC / Triton 产物，不应入库）。
+- fusion_result.json 等 artifacts 已清理并忽略。
+- .gitignore 补充 kernel_meta/、fusion_result.json、workspace/、results/ 等 Ascend/eval 临时目录。
+
+下一步：高效 decode fallback 实现 + OpenCompass 端到端吞吐验证。
+
 ### Phase 5: `0.11.0` 真正迁入 `variants/`
 
 - 已完成：
@@ -595,3 +646,40 @@
   - 当前更合理的判断是：
     - strict checkpoint 本身在这个 prompt 下就不擅长给“极简直接答案”
     - 先前 `0.18.1` 独有的异常，确实主要来自 quick checkpoint 主路径上的 GDN / final norm 迁移缺口
+
+### Phase 16: 0.20.2/CANN9 hybrid GDN 插件统一
+
+- 本轮目标：
+  - 将此前在 CANN9 `site-packages` 中手工验证过的 hybrid GDN 修复收敛进插件
+  - 避免继续依赖手工 patch venv
+- 已统一到插件的逻辑：
+  - `variants/vllm_0_20_2.py`
+    - plain `RMSNorm` 选择
+    - `num_experts=0` dense MLP fallback
+    - `attention_bias` / `enable_qk_norm` 兼容
+  - `compat/ascend.py`
+    - 前置 `ensure_ascend_custom_ops_registered()`
+    - 让插件模型构造前命中 vLLM-Ascend OOT `AscendGatedDeltaNetAttention`
+    - CANN9 head_dim<128 GDN prefill padding workaround
+    - 针对 `AscendGatedDeltaNetAttention._forward_core` 的 decode fallback 实验路径
+- 已验证事实：
+  - 静态测试：
+    - `PYTHONPATH=. pytest tests/test_ascend_static.py tests/test_versioning.py -q`
+    - 当前结果：`39 passed`
+  - plugin register 冒烟：
+    - `op_registry_oot["GatedDeltaNetAttention"]` 已确认指向 `vllm_ascend.ops.gdn.AscendGatedDeltaNetAttention`
+  - 服务启动环境：
+    - 不能用 `PYTHONPATH=/path/to/plugin` 覆盖 Ascend 原环境
+    - 必须使用 `PYTHONPATH=/path/to/plugin:${PYTHONPATH}`
+    - 否则 EngineCore spawn 子进程会丢失 `acl`，报 `ModuleNotFoundError: No module named 'acl'`
+- 当前未完成项：
+  - `AscendGatedDeltaNetAttention` 的 head_dim<128 decode fallback 仍未通过服务级验证
+  - 最新失败集中在 `_torch_recurrent_gated_delta_rule_decode` 的 GQA head/state 对齐
+  - 因此目前不能宣布 0.20.2/CANN9 hybrid GDN 插件化推理已完成
+  - 2026-06-15 OpenCompass GSM8K 继续验证时，已确认请求能进入 vLLM，但性能异常：
+    - vLLM metrics 显示 `num_requests_running` 为十几个、`num_requests_waiting=0`
+    - `prompt_tokens_total` / `generation_tokens_total` 持续增长，说明不是 OpenCompass 空等
+    - NPU2 HBM 占用正常，但 AICore 约 `0-1%`
+    - `VLLM::EngineCore` CPU 占用高
+  - 初步结论：这不是单纯并发不足；OpenCompass `WORKERS`、model `batch_size/max_workers/query_per_second` 以及 vLLM `max_num_seqs/max_num_batched_tokens` 只能作为二级调参。优先问题是 head_dim<128 GDN decode 路径仍可能落到 `_torch_recurrent_gated_delta_rule_decode` 的 Python/torch fallback，导致 CPU-bound decode。
+  - 后续优化方向：把 hd64 recurrent decode 从 Python fallback 收敛到插件内的 NPU fast path 或至少批量化 torch 实现，然后再重跑 GSM8K 吞吐和准确率。

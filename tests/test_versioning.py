@@ -20,6 +20,14 @@ def test_supported_version_key_handles_declared_prefixes() -> None:
     assert versioning.get_supported_version_key("0.18.7") == "vllm_0_18_1"
 
 
+def test_supported_version_key_can_use_env_override_for_source_checkout(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("VLLM_QWEN3_NEXT_PLUGIN_VERSION", "0.11.0")
+
+    assert versioning.get_supported_version_key("dev") == "vllm_0_11_0"
+
+
 def test_variant_module_names_are_declared() -> None:
     mapping = versioning.get_variant_module_names()
 

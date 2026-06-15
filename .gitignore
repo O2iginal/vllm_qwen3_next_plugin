@@ -203,3 +203,16 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+# Ascend / CANN kernel compilation caches and artifacts (Triton + AscendC)
+kernel_meta/
+kernel_meta_temp_*/
+fusion_result.json
+*.acl
+*.log  # some Ascend logs, keep selectively if needed
+
+# Large temp results from eval / profile
+workspace/
+results/
+*.jsonl
+*.summary.json
+gdn_op_isolate*.py  # keep harnesses in gaoyanzipeng, not here unless promoted

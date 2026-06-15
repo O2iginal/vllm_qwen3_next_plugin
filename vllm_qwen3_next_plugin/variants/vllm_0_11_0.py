@@ -103,6 +103,228 @@ from vllm.model_executor.models.utils import (
 
 logger = init_logger(__name__)
 
+_DEBUG_GDN_METADATA_LIMIT = int(
+    os.getenv("VLLM_QWEN3_NEXT_DEBUG_GDN_METADATA_LIMIT", "24")
+)
+_DEBUG_GDN_STATE_LIMIT = int(os.getenv("VLLM_QWEN3_NEXT_DEBUG_GDN_STATE_LIMIT", "24"))
+_DEBUG_LAYER_STATE_LIMIT = int(
+    os.getenv("VLLM_QWEN3_NEXT_DEBUG_LAYER_STATE_LIMIT", "120")
+)
+_DEBUG_ATTENTION_IO_LIMIT = int(
+    os.getenv("VLLM_QWEN3_NEXT_DEBUG_ATTENTION_IO_LIMIT", "120")
+)
+_debug_gdn_metadata_count = 0
+_debug_gdn_state_count = 0
+_debug_layer_state_count = 0
+_debug_attention_io_count = 0
+
+
+def _debug_tensor_head(tensor: Optional[torch.Tensor], limit: int = 8):
+    if tensor is None:
+        return None
+    return tensor.detach().cpu().reshape(-1)[:limit].tolist()
+
+
+def _maybe_log_gdn_metadata(prefix: str, attn_metadata: "GDNAttentionMetadata") -> None:
+    global _debug_gdn_metadata_count
+    if os.getenv("VLLM_QWEN3_NEXT_DEBUG_GDN_METADATA") != "1":
+        return
+    if _debug_gdn_metadata_count >= _DEBUG_GDN_METADATA_LIMIT:
+        return
+    _debug_gdn_metadata_count += 1
+    logger.warning(
+        "Qwen3Next GDN metadata %s",
+        {
+            "source": __file__,
+            "prefix": prefix,
+            "num_prefills": attn_metadata.num_prefills,
+            "num_prefill_tokens": attn_metadata.num_prefill_tokens,
+            "num_decodes": attn_metadata.num_decodes,
+            "num_decode_tokens": attn_metadata.num_decode_tokens,
+            "num_spec_decodes": attn_metadata.num_spec_decodes,
+            "num_spec_decode_tokens": attn_metadata.num_spec_decode_tokens,
+            "num_actual_tokens": attn_metadata.num_actual_tokens,
+            "non_spec_query_start_loc": _debug_tensor_head(
+                attn_metadata.non_spec_query_start_loc
+            ),
+            "non_spec_state_indices": _debug_tensor_head(
+                attn_metadata.non_spec_state_indices_tensor
+            ),
+            "has_initial_state": _debug_tensor_head(attn_metadata.has_initial_state),
+        },
+    )
+
+
+def _debug_state_summary(
+    state: torch.Tensor,
+    indices: Optional[torch.Tensor],
+) -> dict[str, object]:
+    if indices is not None:
+        state = state[indices]
+    state_float = state.detach().float()
+    return {
+        "shape": list(state.shape),
+        "abs_sum": float(state_float.abs().sum().cpu().item()),
+        "max_abs": float(state_float.abs().max().cpu().item())
+        if state_float.numel()
+        else 0.0,
+        "nonzero": int((state_float != 0).sum().cpu().item()),
+    }
+
+
+def _maybe_log_gdn_state(
+    stage: str,
+    prefix: str,
+    attn_metadata: "GDNAttentionMetadata",
+    conv_state: torch.Tensor,
+    ssm_state: torch.Tensor,
+    state_indices: Optional[torch.Tensor],
+) -> None:
+    global _debug_gdn_state_count
+    if os.getenv("VLLM_QWEN3_NEXT_DEBUG_GDN_STATE") != "1":
+        return
+    debug_prefix = os.getenv("VLLM_QWEN3_NEXT_DEBUG_GDN_STATE_PREFIX")
+    if debug_prefix and debug_prefix != prefix:
+        return
+    if _debug_gdn_state_count >= _DEBUG_GDN_STATE_LIMIT:
+        return
+    _debug_gdn_state_count += 1
+    logger.warning(
+        "Qwen3Next GDN state %s",
+        {
+            "source": __file__,
+            "stage": stage,
+            "prefix": prefix,
+            "num_prefills": attn_metadata.num_prefills,
+            "num_prefill_tokens": attn_metadata.num_prefill_tokens,
+            "num_decodes": attn_metadata.num_decodes,
+            "num_decode_tokens": attn_metadata.num_decode_tokens,
+            "non_spec_query_start_loc": _debug_tensor_head(
+                attn_metadata.non_spec_query_start_loc
+            ),
+            "non_spec_state_indices": _debug_tensor_head(state_indices),
+            "conv": _debug_state_summary(conv_state, state_indices),
+            "ssm": _debug_state_summary(ssm_state, state_indices),
+        },
+    )
+
+
+def _debug_layer_state_summary(tensor: torch.Tensor) -> dict[str, object]:
+    tensor_float = tensor.detach().float()
+    last_token = tensor_float[-1] if tensor_float.numel() else tensor_float
+    return {
+        "shape": list(tensor.shape),
+        "last_abs_sum": float(last_token.abs().sum().cpu().item())
+        if last_token.numel()
+        else 0.0,
+        "last_max_abs": float(last_token.abs().max().cpu().item())
+        if last_token.numel()
+        else 0.0,
+        "last_mean": float(last_token.mean().cpu().item()) if last_token.numel() else 0.0,
+        "last_head": _debug_tensor_head(last_token),
+    }
+
+
+def _debug_layer_metadata_summary() -> dict[str, object]:
+    try:
+        attn_metadata = get_forward_context().attn_metadata
+    except Exception:
+        return {}
+    if not isinstance(attn_metadata, dict) or not attn_metadata:
+        return {}
+    first_metadata = next(iter(attn_metadata.values()))
+    return {
+        "attn_state": str(getattr(first_metadata, "attn_state", None)),
+        "num_prefills": getattr(first_metadata, "num_prefills", None),
+        "num_prefill_tokens": getattr(first_metadata, "num_prefill_tokens", None),
+        "num_decodes": getattr(first_metadata, "num_decodes", None),
+        "num_decode_tokens": getattr(first_metadata, "num_decode_tokens", None),
+        "num_actual_tokens": getattr(first_metadata, "num_actual_tokens", None),
+    }
+
+
+def _debug_layer_filter_allows(layer_idx: int) -> bool:
+    raw_layers = os.getenv("VLLM_QWEN3_NEXT_DEBUG_LAYER_STATE_LAYERS")
+    if not raw_layers:
+        return True
+    return str(layer_idx) in {item.strip() for item in raw_layers.split(",")}
+
+
+def _maybe_log_layer_state(
+    stage: str,
+    layer_idx: int,
+    layer_type: str,
+    positions: Optional[torch.Tensor],
+    hidden_states: torch.Tensor,
+) -> None:
+    global _debug_layer_state_count
+    if os.getenv("VLLM_QWEN3_NEXT_DEBUG_LAYER_STATE") != "1":
+        return
+    if not _debug_layer_filter_allows(layer_idx):
+        return
+    if _debug_layer_state_count >= _DEBUG_LAYER_STATE_LIMIT:
+        return
+    _debug_layer_state_count += 1
+    logger.warning(
+        "Qwen3Next layer state %s",
+        {
+            "source": __file__,
+            "stage": stage,
+            "layer_idx": layer_idx,
+            "layer_type": layer_type,
+            "positions_tail": _debug_tensor_head(positions[-4:])
+            if positions is not None and positions.numel()
+            else None,
+            "metadata": _debug_layer_metadata_summary(),
+            "hidden": _debug_layer_state_summary(hidden_states),
+        },
+    )
+
+
+def _debug_attention_io_filter_allows(layer_idx: int) -> bool:
+    raw_layers = os.getenv("VLLM_QWEN3_NEXT_DEBUG_ATTENTION_IO_LAYERS")
+    if not raw_layers:
+        return True
+    return str(layer_idx) in {item.strip() for item in raw_layers.split(",")}
+
+
+def _maybe_log_attention_io(
+    stage: str,
+    layer_idx: int,
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_output: Optional[torch.Tensor] = None,
+) -> None:
+    global _debug_attention_io_count
+    if os.getenv("VLLM_QWEN3_NEXT_DEBUG_ATTENTION_IO") != "1":
+        return
+    if not _debug_attention_io_filter_allows(layer_idx):
+        return
+    if _debug_attention_io_count >= _DEBUG_ATTENTION_IO_LIMIT:
+        return
+    _debug_attention_io_count += 1
+    logger.warning(
+        "Qwen3Next attention io %s",
+        {
+            "source": __file__,
+            "stage": stage,
+            "layer_idx": layer_idx,
+            "positions_tail": _debug_tensor_head(positions[-4:])
+            if positions is not None and positions.numel()
+            else None,
+            "metadata": _debug_layer_metadata_summary(),
+            "query": _debug_layer_state_summary(query),
+            "key": _debug_layer_state_summary(key),
+            "value": _debug_layer_state_summary(value),
+            "attn_output": _debug_layer_state_summary(attn_output)
+            if attn_output is not None
+            else None,
+        },
+    )
+
+
 KVCache = tuple[torch.Tensor, torch.Tensor]
 
 
@@ -702,6 +924,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         assert isinstance(attn_metadata, dict)
         attn_metadata = attn_metadata[self.prefix]
         assert isinstance(attn_metadata, GDNAttentionMetadata)
+        _maybe_log_gdn_metadata(self.prefix, attn_metadata)
         has_initial_state = attn_metadata.has_initial_state
         spec_query_start_loc = attn_metadata.spec_query_start_loc
         non_spec_query_start_loc = attn_metadata.non_spec_query_start_loc
@@ -712,6 +935,14 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         self_kv_cache = self.kv_cache[forward_context.virtual_engine]
         conv_state = self_kv_cache[0].transpose(-1, -2)
         ssm_state = self_kv_cache[1]
+        _maybe_log_gdn_state(
+            "before_conv",
+            self.prefix,
+            attn_metadata,
+            conv_state,
+            ssm_state,
+            non_spec_state_indices_tensor,
+        )
         num_actual_tokens = (
             attn_metadata.num_prefill_tokens
             + attn_metadata.num_decode_tokens
@@ -795,6 +1026,15 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         else:
             mixed_qkv_non_spec = None
 
+        _maybe_log_gdn_state(
+            "after_conv",
+            self.prefix,
+            attn_metadata,
+            conv_state,
+            ssm_state,
+            non_spec_state_indices_tensor,
+        )
+
         query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
         query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(
             mixed_qkv_non_spec
@@ -845,6 +1085,14 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             beta_non_spec = beta
 
         # 3. Recurrent attention
+        _maybe_log_gdn_state(
+            "before_recurrent",
+            self.prefix,
+            attn_metadata,
+            conv_state,
+            ssm_state,
+            non_spec_state_indices_tensor,
+        )
 
         # 3.1: process the mutlti-query part
         if spec_sequence_masks is not None:
@@ -888,24 +1136,56 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 ssm_state.dtype
             )
         elif attn_metadata.num_decodes > 0:
-            core_attn_out_non_spec, last_recurrent_state = (
-                fused_recurrent_gated_delta_rule(
+            if os.getenv("VLLM_QWEN3_NEXT_FORCE_CHUNK_GDN_DECODE") == "1":
+                decode_initial_state = ssm_state[non_spec_state_indices_tensor].contiguous()
+                (
+                    core_attn_out_non_spec,
+                    last_recurrent_state,
+                ) = chunk_gated_delta_rule(
                     q=query_non_spec,
                     k=key_non_spec,
                     v=value_non_spec,
                     g=g_non_spec,
                     beta=beta_non_spec,
-                    initial_state=ssm_state,
-                    inplace_final_state=True,
+                    initial_state=decode_initial_state,
+                    output_final_state=True,
                     cu_seqlens=non_spec_query_start_loc[
                         : attn_metadata.num_decodes + 1
                     ],
-                    ssm_state_indices=non_spec_state_indices_tensor,
+                    head_first=False,
                     use_qk_l2norm_in_kernel=True,
                 )
-            )
+                ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(
+                    ssm_state.dtype
+                )
+            else:
+                core_attn_out_non_spec, last_recurrent_state = (
+                    fused_recurrent_gated_delta_rule(
+                        q=query_non_spec,
+                        k=key_non_spec,
+                        v=value_non_spec,
+                        g=g_non_spec,
+                        beta=beta_non_spec,
+                        initial_state=ssm_state,
+                        inplace_final_state=True,
+                        cu_seqlens=non_spec_query_start_loc[
+                            : attn_metadata.num_decodes + 1
+                        ],
+                        ssm_state_indices=non_spec_state_indices_tensor,
+                        use_qk_l2norm_in_kernel=True,
+                    )
+                )
         else:
             core_attn_out_non_spec, last_recurrent_state = None, None
+
+        _maybe_log_gdn_state(
+            "after_recurrent",
+            self.prefix,
+            attn_metadata,
+            conv_state,
+            ssm_state,
+            non_spec_state_indices_tensor,
+        )
 
         # Merge core attention output
         if spec_sequence_masks is not None and core_attn_out_non_spec is not None:
@@ -943,6 +1223,7 @@ class Qwen3NextAttention(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
+        self.layer_idx = extract_layer_index(prefix)
         self.hidden_size = config.hidden_size
         tp_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = config.num_attention_heads
@@ -1053,7 +1334,7 @@ class Qwen3NextAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.attn",
             **{
-                "layer_idx": extract_layer_index(prefix),
+                "layer_idx": self.layer_idx,
                 "dual_chunk_attention_config": self.dual_chunk_attention_config,
             }
             if self.dual_chunk_attention_config
@@ -1141,7 +1422,17 @@ class Qwen3NextAttention(nn.Module):
                 scale = (torch.log(pos_f + a) / math.log(a)).unsqueeze(-1)
                 q = q * scale
 
+        _maybe_log_attention_io("before_attention", self.layer_idx, positions, q, k, v)
         attn_output = self.attn(q, k, v)
+        _maybe_log_attention_io(
+            "after_attention",
+            self.layer_idx,
+            positions,
+            q,
+            k,
+            v,
+            attn_output,
+        )
 
         if self.attn_output_gate:
             gate = torch.sigmoid(gate)
@@ -1299,6 +1590,13 @@ class Qwen3NextDecoderLayer(nn.Module):
         else:
             raise ValueError("Invalid layer_type")
         hidden_states = self_attention_output
+        _maybe_log_layer_state(
+            "after_attention",
+            self.layer_idx,
+            self.layer_type,
+            positions,
+            hidden_states,
+        )
 
         if self.layer_scale:
             if len(hidden_states.shape) == 2:
@@ -1327,6 +1625,13 @@ class Qwen3NextDecoderLayer(nn.Module):
                     self.ffn_layer_scale.to(hidden_states.dtype) + 1
                 )
 
+        _maybe_log_layer_state(
+            "after_mlp",
+            self.layer_idx,
+            self.layer_type,
+            positions,
+            hidden_states,
+        )
         return hidden_states, residual
 
 

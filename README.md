@@ -10,12 +10,14 @@
 - `0.18.1` 已完成 quick checkpoint 的真实服务级验证
 - `0.18.1 + hybrid gdn + moe` 已完成严格 `vllm serve` 启动与请求返回验证
 - `0.18.1 + hybrid gdn + MTP` 已完成插件侧 speculative decoding 兼容适配，当前开发分支为 `dev/gyzp_mtp`
+- `0.20.2 + CANN9 + trusted hybrid GDN` 正在收敛到 plugin 侧：plain RMSNorm、dense `num_experts=0`、optional QK norm、Ascend OOT op 注册和 hd64 GDN prefill workaround 均由 plugin 注册路径安装；hd64 GDN decode fallback 仍在服务级验证中
 
 ## 当前已验证基线
 
 - 已验证环境：`vllm 0.11.0`
 - 已验证环境：`vllm 0.15.1`
 - 已验证环境：`vllm 0.18.1`
+- 已验证环境：`vllm 0.20.2`（CANN9 / vLLM-Ascend trusted hybrid GDN）
 - 已验证入口：`VLLM_PLUGINS=register_qwen3_next_model`
 - 已验证能力：
   - 插件导入成功
@@ -23,7 +25,38 @@
   - `register()` 会安装 Qwen3Next MTP speculative runtime patches
   - 能真实启动 `python -m vllm.entrypoints.openai.api_server`
   - 能对测试 checkpoint 返回可读自然语言
-  - 能对更严格的 `hybrid gdn + moe` checkpoint 返回可读自然语言
+- 能对更严格的 `hybrid gdn + moe` checkpoint 返回可读自然语言
+- 在 CANN9 trusted hybrid GDN checkpoint 上，plugin 路径当前可启动并返回部分可读自然语言；Janet GSM8K 长 decode 仍未通过，不应视为完成态
+
+## vLLM 0.20.2 / CANN9 trusted hybrid GDN
+
+`0.20.2` 的 trusted hybrid GDN 支持正在收敛到插件中，目标是不再要求手工编辑 `site-packages`。启动时启用 Ascend 插件和本插件，并保留 Ascend 环境已有的 `PYTHONPATH`：
+
+```bash
+PYTHONPATH=/path/to/vllm_qwen3_next_plugin:${PYTHONPATH} \
+VLLM_PLUGINS=ascend,register_qwen3_next_model \
+vllm serve /path/to/trusted-hybrid-gdn \
+  --trust-remote-code \
+  --hf-overrides '{"rms_norm_add_unit_offset": false}'
+```
+
+不要用 `PYTHONPATH=/path/to/plugin` 覆盖原值；否则 CANN9 的 `acl` Python 模块不会传入 EngineCore spawn 子进程。
+
+本路径包含以下兼容逻辑：
+
+- `rms_norm_add_unit_offset=false` 时 decoder block norm 与 final norm 使用普通 `RMSNorm(w)`，官方 Qwen3-Next 默认仍使用 Gemma-style `GemmaRMSNorm(1+w)`。
+- `attention_bias` 可作为 QKV bias 配置来源；`o_proj` 仍固定无 bias。
+- `enable_qk_norm=false` 时跳过 full-attention q/k norm，避免加载不存在的 q_norm/k_norm 权重。
+- `num_experts=0` 被视为 dense 模型，MoE metadata 计数置零。
+- CANN9/vLLM-Ascend 上 head_dim<128 的 GDN prefill 会 pad 到 128 走 triton h/o kernel 后 slice 回真实维度。
+- head_dim<128 的 GDN decode fallback 仍在调试，当前服务级 GSM8K 不是完成态；官方 128-dim 路径不受影响。
+- 2026-06-15 OpenCompass GSM8K 观察到 `num_requests_running>0`、`num_requests_waiting=0` 时 NPU AICore 仍约 `0-1%`，而 `VLLM::EngineCore` CPU 占用较高；这不是单纯 OpenCompass worker/batch size 或 vLLM `max_num_seqs` 并发不足，更像 head_dim<128 GDN decode 落到 Python/torch fallback 后的 CPU-bound 路径。后续优化应优先把 `_torch_recurrent_gated_delta_rule_decode` 替换为 NPU fast path 或可批量化实现，再评估并发参数。
+
+调试时可关闭 hd64 GDN workaround：
+
+```bash
+VLLM_QWEN3_NEXT_DISABLE_GDN_HD64_FIX=1
+```
 
 本轮重构的最低要求不是“还能 import”，而是至少回到这个服务级基线。
 
