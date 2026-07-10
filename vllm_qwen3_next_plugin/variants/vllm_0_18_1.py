@@ -475,6 +475,35 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             self.shared_expert_gate = None
             self.shared_expert = None
 
+        # Mirror Megatron MoM-SQ training: combine weight = sqrt(probs_post_topk),
+        # with NO re-normalization afterwards. See router.py L559-571 in gyzp_mom.
+        # HF modeling_qwen3_next.py L1097-1103 mirrors the same logic.
+        score_func = getattr(config, "moe_router_score_function", "softmax")
+        sqrt_gate = bool(getattr(config, "moe_router_sqrt_gate", False))
+
+        custom_routing_function = None
+        if sqrt_gate:
+            from vllm.model_executor.layers.fused_moe import fused_topk
+
+            def _sqrt_gate_routing(hidden_states, gating_output, topk, renormalize):
+                topk_weights, topk_ids, _ = fused_topk(
+                    hidden_states=hidden_states,
+                    gating_output=gating_output,
+                    topk=topk,
+                    renormalize=renormalize,
+                    indices_type=torch.int32,
+                    scoring_func=score_func,
+                )
+                tiny = torch.finfo(topk_weights.dtype).tiny
+                topk_weights = topk_weights.clamp_min(tiny).sqrt()
+                return topk_weights, topk_ids
+
+            custom_routing_function = _sqrt_gate_routing
+            print(
+                f"[vLLM Plugin] sqrt-gate enabled for {prefix}.experts "
+                f"(score_func={score_func})"
+            )
+
         self.experts = SharedFusedMoE(
             shared_experts=self.shared_expert,
             gate=self.gate,
@@ -484,6 +513,8 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             intermediate_size=config.moe_intermediate_size,
             reduce_results=False,
             renormalize=getattr(config, "norm_topk_prob", True),
+            scoring_func=score_func,
+            custom_routing_function=custom_routing_function,
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
             enable_eplb=self.enable_eplb,
@@ -804,6 +835,30 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         value = rearrange(value, "l (h d) -> 1 l h d", d=self.head_v_dim)
         return query.contiguous(), key.contiguous(), value.contiguous()
 
+    def _apply_gdn_rotary_emb(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        num_k_heads = self.num_k_heads // self.tp_size
+        query_flat = rearrange(query, "1 l h d -> l (h d)")
+        key_flat = rearrange(key, "1 l h d -> l (h d)")
+        query_flat, key_flat = self.rotary_emb(positions, query_flat, key_flat)
+        query = rearrange(
+            query_flat,
+            "l (h d) -> 1 l h d",
+            h=num_k_heads,
+            d=self.head_k_dim,
+        )
+        key = rearrange(
+            key_flat,
+            "l (h d) -> 1 l h d",
+            h=num_k_heads,
+            d=self.head_k_dim,
+        )
+        return query.contiguous(), key.contiguous()
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1101,11 +1156,11 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 positions_spec = None
                 positions_non_spec = positions
             if query_spec is not None and positions_spec is not None:
-                query_spec, key_spec = self.rotary_emb(
+                query_spec, key_spec = self._apply_gdn_rotary_emb(
                     positions_spec, query_spec, key_spec
                 )
             if query_non_spec is not None and positions_non_spec is not None:
-                query_non_spec, key_non_spec = self.rotary_emb(
+                query_non_spec, key_non_spec = self._apply_gdn_rotary_emb(
                     positions_non_spec, query_non_spec, key_non_spec
                 )
 
@@ -1240,6 +1295,21 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             conv_state_indices=non_spec_state_indices_tensor[:num_actual_tokens],
             validate_data=False,
         )
+        if self.rotary_emb is not None:
+            gdn_positions = getattr(get_forward_context(), "gdn_positions", None)
+            positions = (
+                gdn_positions.get(self.prefix)
+                if isinstance(gdn_positions, dict)
+                else None
+            )
+            if positions is not None:
+                positions_ns = positions[:num_actual_tokens]
+                query, key, value = self.rearrange_mixed_qkv(mixed_qkv_non_spec)
+                query, key = self._apply_gdn_rotary_emb(positions_ns, query, key)
+                query = rearrange(query, "1 l h d -> l (h d)")
+                key = rearrange(key, "1 l h d -> l (h d)")
+                value = rearrange(value, "1 l h d -> l (h d)")
+                mixed_qkv_non_spec = torch.cat((query, key, value), dim=-1)
         out_buf = core_attn_out[:num_actual_tokens].unsqueeze(1)
         fused_recurrent_gated_delta_rule_packed_decode(
             mixed_qkv=mixed_qkv_non_spec,

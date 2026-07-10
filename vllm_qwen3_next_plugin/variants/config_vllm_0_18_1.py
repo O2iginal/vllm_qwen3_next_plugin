@@ -139,6 +139,11 @@ class Qwen3NextConfig(PretrainedConfig):
             allow the model to output the auxiliary loss, including load balancing loss and router z-loss.
         router_aux_loss_coef (`float`, *optional*, defaults to 0.001):
             The aux loss factor for the total loss.
+        moe_router_score_function (`str`, *optional*, defaults to `"softmax"`):
+            Router score function used before top-k selection.
+        moe_router_sqrt_gate (`bool`, *optional*, defaults to `False`):
+            When enabled, apply sqrt to post-topk router weights without
+            re-normalization, matching Megatron MoM-SQ training.
         mlp_only_layers (`list[int]`, *optional*, defaults to `[]`):
             Indicate which layers use Qwen3NextMLP rather than Qwen3NextSparseMoeBlock
             The list contains layer index, from 0 to num_layers-1 if we have num_layers layers
@@ -215,6 +220,8 @@ class Qwen3NextConfig(PretrainedConfig):
         norm_topk_prob=True,
         output_router_logits=False,
         router_aux_loss_coef=0.001,
+        moe_router_score_function="softmax",
+        moe_router_sqrt_gate=False,
         mlp_only_layers=None,
         layer_types=None,
         # Token shifting (cannon layer): None | "cat" | "conv"
@@ -299,6 +306,8 @@ class Qwen3NextConfig(PretrainedConfig):
         self.norm_topk_prob = norm_topk_prob
         self.output_router_logits = output_router_logits
         self.router_aux_loss_coef = router_aux_loss_coef
+        self.moe_router_score_function = moe_router_score_function
+        self.moe_router_sqrt_gate = moe_router_sqrt_gate
         self.mlp_only_layers = mlp_only_layers
 
         # Token shifting (cannon layer).

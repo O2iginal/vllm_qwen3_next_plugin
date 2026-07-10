@@ -28,6 +28,8 @@ def test_config_0_18_1_accepts_custom_architecture_fields() -> None:
         gated_norm_rank=32,
         gated_norm_gate_scale=0.5,
         attn_qk_norm=True,
+        moe_router_score_function="softmax",
+        moe_router_sqrt_gate=True,
     )
 
     assert config.attn_position_embedding_type == "nope"
@@ -46,6 +48,15 @@ def test_config_0_18_1_accepts_custom_architecture_fields() -> None:
     assert config.gated_norm_rank == 32
     assert config.gated_norm_gate_scale == 0.5
     assert config.attn_qk_norm is True
+    assert config.moe_router_score_function == "softmax"
+    assert config.moe_router_sqrt_gate is True
+
+
+def test_config_0_18_1_moe_router_defaults() -> None:
+    config = Qwen3NextConfig()
+
+    assert config.moe_router_score_function == "softmax"
+    assert config.moe_router_sqrt_gate is False
 
 
 def test_config_0_18_1_rejects_invalid_custom_field_values() -> None:
