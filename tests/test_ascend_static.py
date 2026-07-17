@@ -564,7 +564,7 @@ def test_torch_recurrent_decode_fallback_expands_gdn_gqa_heads() -> None:
     assert out.shape == (1, 32, 64)
 
 
-def test_torch_recurrent_decode_vectorization_matches_token_loop_with_pad() -> None:
+def test_torch_recurrent_decode_no_host_sync_matches_token_loop_with_pad() -> None:
     from vllm_qwen3_next_plugin.compat.ascend import (
         PAD_SLOT_ID,
         _torch_recurrent_gated_delta_rule_decode,
@@ -617,5 +617,16 @@ def test_torch_recurrent_decode_vectorization_matches_token_loop_with_pad() -> N
         ssm_state_indices=state_indices,
     )
 
-    assert torch.allclose(actual_output, expected_output, atol=1e-6, rtol=1e-6)
-    assert torch.allclose(actual_state, expected_state, atol=1e-6, rtol=1e-6)
+    assert torch.equal(actual_output, expected_output)
+    assert torch.equal(actual_state, expected_state)
+
+
+def test_torch_recurrent_decode_avoids_scalar_item_sync() -> None:
+    source = ASCEND_COMPAT.read_text(encoding="utf-8")
+    function_source = source.split(
+        "def _torch_recurrent_gated_delta_rule_decode(", 1
+    )[1].split("\ndef _wrap_ascend_chunk_gated_delta_rule", 1)[0]
+
+    assert ".item()" not in function_source
+    assert "state.index_select(0, safe_cache_idx)" in function_source
+    assert "state.index_copy_(0, safe_cache_idx" in function_source
