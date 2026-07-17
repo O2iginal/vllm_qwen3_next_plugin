@@ -562,3 +562,60 @@ def test_torch_recurrent_decode_fallback_expands_gdn_gqa_heads() -> None:
     )
 
     assert out.shape == (1, 32, 64)
+
+
+def test_torch_recurrent_decode_vectorization_matches_token_loop_with_pad() -> None:
+    from vllm_qwen3_next_plugin.compat.ascend import (
+        PAD_SLOT_ID,
+        _torch_recurrent_gated_delta_rule_decode,
+    )
+
+    torch.manual_seed(17)
+    query = torch.randn((3, 2, 3), dtype=torch.float32)
+    key = torch.randn((3, 2, 3), dtype=torch.float32)
+    value = torch.randn((3, 4, 5), dtype=torch.float32)
+    g = -torch.rand((3, 4), dtype=torch.float32)
+    beta = torch.sigmoid(torch.randn((3, 4), dtype=torch.float32))
+    state = torch.randn((4, 4, 3, 5), dtype=torch.float32)
+    state_indices = torch.tensor([2, PAD_SLOT_ID, 0])
+    scale = 3**-0.5
+
+    expected_output = torch.zeros_like(value)
+    expected_state = state.clone()
+    expanded_query = query.repeat_interleave(2, dim=1)
+    expanded_key = key.repeat_interleave(2, dim=1)
+    for token_idx, cache_idx in ((0, 2), (2, 0)):
+        state_t = expected_state[cache_idx].float()
+        q_t = expanded_query[token_idx].float()
+        k_t = expanded_key[token_idx].float()
+        v_t = value[token_idx].float()
+        g_t = g[token_idx].float()
+        beta_t = beta[token_idx].float()
+        decay_t = g_t.exp()
+        v_new = v_t * beta_t.unsqueeze(-1) - torch.einsum(
+            "hk,hkv->hv", k_t * beta_t.unsqueeze(-1) * decay_t.unsqueeze(-1), state_t
+        )
+        expected_output[token_idx] = (
+            torch.einsum(
+                "hk,hkv->hv", q_t * scale * decay_t.unsqueeze(-1), state_t
+            )
+            + (q_t * scale * k_t).sum(dim=-1, keepdim=True) * v_new
+        )
+        expected_state[cache_idx] = state_t * decay_t.view(-1, 1, 1) + torch.einsum(
+            "hk,hv->hkv", k_t, v_new
+        )
+
+    actual_state = state.clone()
+    actual_output = _torch_recurrent_gated_delta_rule_decode(
+        query=query,
+        key=key,
+        value=value,
+        g=g,
+        beta=beta,
+        state=actual_state,
+        scale=scale,
+        ssm_state_indices=state_indices,
+    )
+
+    assert torch.allclose(actual_output, expected_output, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(actual_state, expected_state, atol=1e-6, rtol=1e-6)

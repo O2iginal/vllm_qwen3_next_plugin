@@ -397,6 +397,14 @@ def _torch_recurrent_gated_delta_rule_decode(
     ssm_state_indices: torch.Tensor,
     **_kwargs,
 ) -> torch.Tensor:
+    """Vectorized one-token-per-sequence recurrent decode on the tensor device.
+
+    The vLLM decode metadata supplies one distinct cache slot for every active
+    sequence.  Speculative multi-token state indices are two-dimensional and do
+    not enter this fallback.  Keeping cache selection as tensors avoids the
+    per-token ``.item()`` device synchronizations that otherwise dominate the
+    49 GDN layers of this model.
+    """
     if beta is None:
         beta = torch.ones_like(g)
     target_heads = max(query.shape[1], key.shape[1], value.shape[1], beta.shape[1])
@@ -425,34 +433,37 @@ def _torch_recurrent_gated_delta_rule_decode(
                 f"Cannot expand {beta.shape[1]} beta heads to {target_heads} target heads"
             )
         beta = beta.repeat_interleave(target_heads // beta.shape[1], dim=1)
-    output = torch.empty_like(value)
-    for token_idx in range(query.shape[0]):
-        cache_idx = int(ssm_state_indices[token_idx].item())
-        if cache_idx == PAD_SLOT_ID:
-            output[token_idx].zero_()
-            continue
-        state_t = state[cache_idx].float()
-        q_t = query[token_idx].float()
-        k_t = key[token_idx].float()
-        v_t = value[token_idx].float()
-        g_t = g[token_idx].float()
-        beta_t = beta[token_idx].float()
-        decay_t = g_t.exp()
-        v_beta = v_t * beta_t.unsqueeze(-1)
-        k_beta = k_t * beta_t.unsqueeze(-1)
-        v_prime = torch.einsum(
-            "hk,hkv->hv", k_beta * decay_t.unsqueeze(-1), state_t
+    valid_mask = ssm_state_indices.ne(PAD_SLOT_ID)
+    valid_positions = torch.nonzero(valid_mask, as_tuple=False).flatten()
+    cache_indices = ssm_state_indices.index_select(0, valid_positions)
+
+    q_t = query.index_select(0, valid_positions).float()
+    k_t = key.index_select(0, valid_positions).float()
+    v_t = value.index_select(0, valid_positions).float()
+    g_t = g.index_select(0, valid_positions).float()
+    beta_t = beta.index_select(0, valid_positions).float()
+    state_t = state.index_select(0, cache_indices).float()
+
+    decay_t = g_t.exp()
+    v_beta = v_t * beta_t.unsqueeze(-1)
+    k_beta = k_t * beta_t.unsqueeze(-1)
+    v_prime = torch.einsum(
+        "thk,thkv->thv", k_beta * decay_t.unsqueeze(-1), state_t
+    )
+    v_new = v_beta - v_prime
+    out_t = (
+        torch.einsum(
+            "thk,thkv->thv", q_t * scale * decay_t.unsqueeze(-1), state_t
         )
-        v_new = v_beta - v_prime
-        out_t = (
-            torch.einsum("hk,hkv->hv", q_t * scale * decay_t.unsqueeze(-1), state_t)
-            + (q_t * scale * k_t).sum(dim=-1, keepdim=True) * v_new
-        )
-        output[token_idx] = out_t.to(value.dtype)
-        state_t = state_t * decay_t.view(-1, 1, 1) + torch.einsum(
-            "hk,hv->hkv", k_t, v_new
-        )
-        state[cache_idx] = state_t.to(state.dtype)
+        + (q_t * scale * k_t).sum(dim=-1, keepdim=True) * v_new
+    )
+    next_state = state_t * decay_t.unsqueeze(-1).unsqueeze(-1) + torch.einsum(
+        "thk,thv->thkv", k_t, v_new
+    )
+
+    output = torch.zeros_like(value)
+    output.index_copy_(0, valid_positions, out_t.to(value.dtype))
+    state.index_copy_(0, cache_indices, next_state.to(state.dtype))
     return output
 
 
