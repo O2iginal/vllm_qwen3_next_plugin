@@ -1,3 +1,4 @@
+import ast
 import re
 from pathlib import Path
 
@@ -627,6 +628,21 @@ def test_torch_recurrent_decode_avoids_scalar_item_sync() -> None:
         "def _torch_recurrent_gated_delta_rule_decode(", 1
     )[1].split("\ndef _wrap_ascend_chunk_gated_delta_rule", 1)[0]
 
-    assert ".item(" not in function_source
+    module = ast.parse(source)
+    function = next(
+        node
+        for node in ast.walk(module)
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_torch_recurrent_gated_delta_rule_decode"
+    )
+    item_calls = [
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "item"
+    ]
+
+    assert item_calls == []
     assert "state.index_select(0, safe_cache_idx)" in function_source
     assert "state.index_copy_(0, safe_cache_idx" in function_source
