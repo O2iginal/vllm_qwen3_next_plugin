@@ -627,6 +627,6 @@ def test_torch_recurrent_decode_avoids_scalar_item_sync() -> None:
         "def _torch_recurrent_gated_delta_rule_decode(", 1
     )[1].split("\ndef _wrap_ascend_chunk_gated_delta_rule", 1)[0]
 
-    assert ".item()" not in function_source
+    assert ".item(" not in function_source
     assert "state.index_select(0, safe_cache_idx)" in function_source
     assert "state.index_copy_(0, safe_cache_idx" in function_source
