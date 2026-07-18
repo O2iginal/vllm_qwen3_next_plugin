@@ -151,6 +151,18 @@ def test_0202_variant_contains_hybrid_gdn_structure_fixes() -> None:
     assert "self.num_routed_experts = 0" in source
 
 
+def test_0202_variant_preserves_yulan_nope_and_sqrt_gate_semantics() -> None:
+    source = QWEN3_NEXT_0202.read_text(encoding="utf-8")
+    ascend_source = ASCEND_COMPAT.read_text(encoding="utf-8")
+
+    assert 'getattr(config, "attn_position_embedding_type", "rope") == "nope"' in source
+    assert "if self.rotary_emb is not None:" in source
+    assert 'getattr(config, "moe_router_sqrt_gate", False)' in source
+    assert "topk_weights.clamp_min(tiny).sqrt()" in source
+    assert "custom_routing_function=custom_routing_function" in source
+    assert "if self.rotary_emb is not None:" in ascend_source
+
+
 def test_ascend_compat_installs_hd64_gdn_runtime_workarounds() -> None:
     source = ASCEND_COMPAT.read_text(encoding="utf-8")
     init_source = PLUGIN_INIT.read_text(encoding="utf-8")

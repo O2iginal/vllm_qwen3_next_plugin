@@ -184,6 +184,36 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         else:
             self.shared_expert = None
 
+        # The YuLan hybrid checkpoint was trained with sqrt-gated routing:
+        # softmax -> top-k -> optional normalization -> sqrt.  vLLM's default
+        # routing silently omits the final sqrt, which changes every MoE layer.
+        score_func = getattr(config, "moe_router_score_function", "softmax")
+        sqrt_gate = bool(getattr(config, "moe_router_sqrt_gate", False))
+
+        custom_routing_function = None
+        if sqrt_gate:
+
+            def _sqrt_gate_routing(
+                hidden_states, gating_output, topk, renormalize, **_kwargs
+            ):
+                # Keep this implementation device-agnostic.  fused_topk calls
+                # the CUDA-only _moe_C.topk_softmax, which is unavailable on NPU.
+                if score_func == "softmax":
+                    scores = torch.softmax(gating_output.float(), dim=-1).to(
+                        gating_output.dtype
+                    )
+                else:
+                    scores = torch.sigmoid(gating_output)
+                topk_weights, topk_ids = scores.topk(topk, dim=-1)
+                if renormalize:
+                    topk_weights = topk_weights / topk_weights.sum(
+                        dim=-1, keepdim=True
+                    )
+                tiny = torch.finfo(topk_weights.dtype).tiny
+                return topk_weights.clamp_min(tiny).sqrt(), topk_ids.to(torch.int32)
+
+            custom_routing_function = _sqrt_gate_routing
+
         self.experts = FusedMoE(
             shared_experts=self.shared_expert,
             gate=self.gate,
@@ -192,6 +222,8 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             renormalize=getattr(config, "norm_topk_prob", True),
+            scoring_func=score_func,
+            custom_routing_function=custom_routing_function,
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
             enable_eplb=self.enable_eplb,
@@ -285,12 +317,15 @@ class Qwen3NextAttention(nn.Module):
             prefix=f"{prefix}.o_proj",
         )
 
-        self.rotary_emb = get_rope(
-            head_size=self.head_dim,
-            max_position=config.max_position_embeddings,
-            rope_parameters=config.rope_parameters,
-            dual_chunk_attention_config=self.dual_chunk_attention_config,
-        )
+        if getattr(config, "attn_position_embedding_type", "rope") == "nope":
+            self.rotary_emb = None
+        else:
+            self.rotary_emb = get_rope(
+                head_size=self.head_dim,
+                max_position=config.max_position_embeddings,
+                rope_parameters=config.rope_parameters,
+                dual_chunk_attention_config=self.dual_chunk_attention_config,
+            )
 
         self.attn = Attention(
             self.num_heads,
@@ -344,7 +379,8 @@ class Qwen3NextAttention(nn.Module):
                 -1, self.num_kv_heads * self.head_dim
             )
 
-        q, k = self.rotary_emb(positions, q, k)
+        if self.rotary_emb is not None:
+            q, k = self.rotary_emb(positions, q, k)
 
         attn_output = self.attn(q, k, v)
 

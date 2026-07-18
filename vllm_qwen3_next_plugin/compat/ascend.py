@@ -1359,7 +1359,11 @@ def patch_plugin_qwen3_next_attention(qwen3_next_model_cls: object) -> bool:
                     -1, self.num_kv_heads * self.head_dim
                 )
 
-            q, k = self.rotary_emb(positions, q, k)
+            # YuLan's full-attention layers may explicitly use NoPE.  The
+            # plugin variant represents that as rotary_emb=None; do not let
+            # the Ascend forward patch re-introduce RoPE.
+            if self.rotary_emb is not None:
+                q, k = self.rotary_emb(positions, q, k)
 
         attn_output = self.attn(q, k, v)
 
