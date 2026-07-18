@@ -10,7 +10,7 @@
 - `0.18.1` 已完成 quick checkpoint 的真实服务级验证
 - `0.18.1 + hybrid gdn + moe` 已完成严格 `vllm serve` 启动与请求返回验证
 - `0.18.1 + hybrid gdn + MTP` 已完成插件侧 speculative decoding 兼容适配，当前开发分支为 `dev/gyzp_mtp`
-- `0.20.2 + CANN9 + trusted hybrid GDN` 正在收敛到 plugin 侧：plain RMSNorm、dense `num_experts=0`、optional QK norm、Ascend OOT op 注册和 hd64 GDN prefill workaround 均由 plugin 注册路径安装；hd64 GDN decode fallback 仍在服务级验证中
+- `0.20.2 + CANN9 + trusted hybrid GDN` 已完成真实TP4+EP服务和完整GSM8K验证；plugin负责NoPE、sqrt-gate等模型语义，head_dim=64 recurrent正确性还依赖下述vLLM-Ascend `native_compact`运行时提交
 
 ## 当前已验证基线
 
@@ -26,17 +26,25 @@
   - 能真实启动 `python -m vllm.entrypoints.openai.api_server`
   - 能对测试 checkpoint 返回可读自然语言
 - 能对更严格的 `hybrid gdn + moe` checkpoint 返回可读自然语言
-- 在 CANN9 trusted hybrid GDN checkpoint 上，plugin 路径当前可启动并返回部分可读自然语言；Janet GSM8K 长 decode 仍未通过，不应视为完成态
+- CANN9 trusted hybrid GDN checkpoint 已通过Janet长decode、20题门和GSM8K全集1319题验证；最终为1129/1319=85.60%，与历史同配置86.884%相差1.28pp，按“约86%”口径判定PASS
 
 ## vLLM 0.20.2 / CANN9 trusted hybrid GDN
 
-`0.20.2` 的 trusted hybrid GDN 支持正在收敛到插件中，目标是不再要求手工编辑 `site-packages`。启动时启用 Ascend 插件和本插件，并保留 Ascend 环境已有的 `PYTHONPATH`：
+`0.20.2` 的 trusted hybrid GDN模型语义已经收敛到插件；CANN9 head_dim=64 recurrent运行时还需使用
+vLLM-Ascend commit `eeb96a64ba97a85e319a2da0fccb2420971a04f9`或其后继版本。不要手工编辑单个
+`site-packages`文件：应安装/checkout该vLLM-Ascend版本，并确认运行时`gdn.py`与源码一致。启动时启用Ascend插件和
+本插件，保留Ascend环境已有的`PYTHONPATH`：
 
 ```bash
 PYTHONPATH=/path/to/vllm_qwen3_next_plugin:${PYTHONPATH} \
 VLLM_PLUGINS=ascend,register_qwen3_next_model \
+VLLM_QWEN3_NEXT_DISABLE_GDN_HD64_FIX=1 \
+VLLM_ASCEND_GDN_HD64_DECODE_BACKEND=native_compact \
 vllm serve /path/to/trusted-hybrid-gdn \
   --trust-remote-code \
+  --trust-request-chat-template \
+  --enable-expert-parallel \
+  --tensor-parallel-size 4 \
   --hf-overrides '{"rms_norm_add_unit_offset": false}'
 ```
 
@@ -48,11 +56,12 @@ vllm serve /path/to/trusted-hybrid-gdn \
 - `attention_bias` 可作为 QKV bias 配置来源；`o_proj` 仍固定无 bias。
 - `enable_qk_norm=false` 时跳过 full-attention q/k norm，避免加载不存在的 q_norm/k_norm 权重。
 - `num_experts=0` 被视为 dense 模型，MoE metadata 计数置零。
-- CANN9/vLLM-Ascend 上 head_dim<128 的 GDN prefill 会 pad 到 128 走 triton h/o kernel 后 slice 回真实维度。
-- head_dim<128 的 GDN decode fallback 仍在调试，当前服务级 GSM8K 不是完成态；官方 128-dim 路径不受影响。
-- 2026-06-15 OpenCompass GSM8K 观察到 `num_requests_running>0`、`num_requests_waiting=0` 时 NPU AICore 仍约 `0-1%`，而 `VLLM::EngineCore` CPU 占用较高；这不是单纯 OpenCompass worker/batch size 或 vLLM `max_num_seqs` 并发不足，更像 head_dim<128 GDN decode 落到 Python/torch fallback 后的 CPU-bound 路径。后续优化应优先把 `_torch_recurrent_gated_delta_rule_decode` 替换为 NPU fast path 或可批量化实现，再评估并发参数。
+- 本轮验证的head_dim=64 decode由vLLM-Ascend `native_compact`把活动SSM状态映射到连续slot，再调用原生NPU recurrent算子并写回side cache；它不是旧的Python/Torch decode fallback。
+- 插件环境变量`VLLM_QWEN3_NEXT_DISABLE_GDN_HD64_FIX=1`只关闭插件内较旧的hd64 monkey patch，不能同时关闭vLLM-Ascend的修复；后者使用不同的`VLLM_ASCEND_DISABLE_GDN_HD64_WORKAROUND`开关，正式运行不要设置为1。
+- 当前hd64 prefill为正确性保留Torch chunk fallback。完整GSM8K八副本运行中，动态加入一个prompt会让已有decode停约20--40秒，全集耗时约2小时32分；下一步应先验证fused chunk prefill在连续长请求和slot复用下的正确性，再进行性能切换。
+- 2026-07-18全集验证使用修正版550B roundtrip HF、TP4+EP、八个服务副本和OpenCompass `qwen3_reason_32k`口径。温度0.6会产生逐样本采样翻转，因此85.60%不表示逐字复现历史86.884%，但已通过任务级质量门、完整输出门和真实NPU递推回归。
 
-调试时可关闭 hd64 GDN workaround：
+调试插件自身的旧hd64 patch时可使用：
 
 ```bash
 VLLM_QWEN3_NEXT_DISABLE_GDN_HD64_FIX=1
