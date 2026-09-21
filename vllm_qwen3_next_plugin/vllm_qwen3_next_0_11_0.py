@@ -119,11 +119,12 @@ class GatedRMSNorm(nn.Module):
         eps: float = 1e-6,
         rank: int = 16,
         gate_scale: float = 1.0,
+        up_bias: bool = False,
     ) -> None:
         super().__init__()
         self.rms_norm = RMSNorm(hidden_size, eps=eps)
         self.w_down = nn.Linear(hidden_size, rank, bias=False)
-        self.w_up = nn.Linear(rank, hidden_size, bias=False)
+        self.w_up = nn.Linear(rank, hidden_size, bias=up_bias)
         self.gate_scale = gate_scale
         self._init_gate_weights()
 
@@ -159,6 +160,7 @@ def _get_qwen3_next_norm_cls(config):
     if t == "gated_rms":
         rank = getattr(config, "gated_norm_rank", 16)
         gate_scale = getattr(config, "gated_norm_gate_scale", 1.0)
+        up_bias = getattr(config, "gated_norm_up_bias", False)
 
         def _factory(hidden_size: int, eps: float = 1e-6) -> GatedRMSNorm:
             return GatedRMSNorm(
@@ -166,6 +168,7 @@ def _get_qwen3_next_norm_cls(config):
                 eps=eps,
                 rank=rank,
                 gate_scale=gate_scale,
+                up_bias=up_bias,
             )
 
         return _factory
@@ -1365,9 +1368,14 @@ class Qwen3NextModel(nn.Module):
             ["hidden_states", "residual"], config.hidden_size
         )
 
-        # Final norm: always RMSNorm so checkpoint model.norm.weight loads (HF uses LlamaRMSNorm for final norm).
         if get_pp_group().is_last_rank:
-            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            use_gated_final_norm = getattr(config, "final_gated_norm", False)
+            if use_gated_final_norm:
+                self.norm = _get_qwen3_next_norm_cls(config)(
+                    config.hidden_size, eps=config.rms_norm_eps
+                )
+            else:
+                self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
 

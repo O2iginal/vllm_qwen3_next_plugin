@@ -190,6 +190,16 @@
 - **0_10_2 与 0_11_0**：上述修改在 `vllm_qwen3_next_0_10_2.py` 中均有对应实现，复用时两处需同步更新（尤其 GDN positions 传递、Token shift、RoPE 等）。
 - **ForwardContext**：vLLM 的 `ForwardContext` 为 dataclass，无 `.get`/`.setdefault`；自定义字段请用 `getattr`/`setattr` 读写，否则在 Dynamo 编译下会触发 AttributeError。
 
+## 10. Final gated norm and up-projection bias
+
+**Intent**: support checkpoints whose final norm is `gated_rms` and whose `w_up` projection has a bias. Previously, the causal LM always created a plain final `RMSNorm`, so loading failed on `model.norm.weight`; additionally, `model.norm.w_up.bias` was ignored even when `gated_norm_up_bias=true`.
+
+**Changes**:
+
+- `GatedRMSNorm` accepts `up_bias` and creates `w_up.bias` when required.
+- The norm factory reads `gated_norm_up_bias`.
+- The final norm uses the gated norm when `final_gated_norm=true`; otherwise it remains plain RMS norm.
+
 ---
 
 ## 0_11_0 实现状态小结（便于复用核对）
