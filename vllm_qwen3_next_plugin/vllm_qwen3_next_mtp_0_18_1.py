@@ -28,7 +28,7 @@ from vllm.model_executor.models.utils import (
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs import Qwen3NextConfig
 
-from .vllm_qwen3_next_0_15_1 import (
+from .vllm_qwen3_next_0_18_1 import (
     Qwen3NextDecoderLayer,
     QwenNextMixtureOfExperts,
     _get_qwen3_next_norm_cls,
@@ -262,7 +262,7 @@ class Qwen3NextMTP(nn.Module, QwenNextMixtureOfExperts):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,

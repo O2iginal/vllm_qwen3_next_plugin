@@ -224,3 +224,35 @@
 创建本 `CHANGELOG.md` 时，vLLM 版本为 0.11.0.
 
 ## 0.15.1
+
+## 0.18.1
+
+- 新增 `vllm_qwen3_next_0_18_1.py` / `vllm_qwen3_next_config_0_18_1.py` / `vllm_qwen3_next_mtp_0_18_1.py`：基于 stock 0.18.1 重放全部自定义 delta（GatedRMSNorm 含 `gated_norm_up_bias`/`final_gated_norm`、token-shift/cannon 卷积、rope/nope、qk_norm、`num_experts==0` fallback 等）；stock config 在 0.15.1 与 0.18.1 之间逐字节一致，config delta 1:1 迁移。GDN RoPE 逻辑挂入重构后的 `_forward_core`；启用 GDN RoPE 时绕过不解体 q/k 的 packed-decode 快路径。保留 stock 0.18 的 FlashInfer GDN prefill、kernel warmup 等优化。
+- `__init__.py` 分发新增 `0.18` 分支。
+
+## 10. MoE router sqrt gate（moe_router_sqrt_gate）
+
+**意图**：对齐 Megatron `megatron/core/transformer/moe/router.py` 的 sqrt-gate：softmax → top-k → L1 归一化之后，将选中专家的组合权重替换为 `sqrt(w)`（未选中保持 0，不再二次归一化；sum-to-1 仅保留给上游 aux-loss 语义）。
+
+**修改要点**：
+
+- 通过 `FusedMoE`/`SharedFusedMoE` 的 `custom_routing_function` 钩子实现 `_sqrt_gate_routing_function`（内部调用各版本自带的 `fused_topk`，返回 `topk_weights.sqrt()` 与原始 ids）。
+- 0_11_0 / 0_15_1 / 0_18_1 均已接入；config 新增 `moe_router_sqrt_gate=False`（默认关闭）。
+
+## 11. MLP gate/up 软钳制（activation_func_clamp_value）
+
+**意图**：对齐 HF 参考 `modeling_qwen3_next.py`：`gate = c*tanh(gate/c)`、`up = c*tanh(up/c)` 后再做 `silu(gate)*up`（c=7.0）。
+
+**修改要点**：
+
+- 以 `_SiluAndMulClampShim` 包装类包裹 `torch.ops._C.silu_and_mul`：未激活时透传原 `OpOverloadPacket`（`__getattr__` 委托，`.default` 等属性完整，不影响 torch.compile fusion 的 pattern matching）；激活后按 HF 公式逐元素计算。MoE 各后端（fused_experts 内联调用与 modular activation）与 dense MLP/shared expert 的 `SiluAndMul` 均覆盖。
+- config 新增 `activation_func_clamp_value=None`、`activation_func_clamp_mode="soft"`；非 soft 模式或多模型值冲突会显式报错。
+- 已知边界：FlashInfer CUTLASS MoE 内核路径（0.11 需 `VLLM_USE_FLASHINFER_MOE_FP16=1`+EP；0.18+DP）在 kernel 内部做激活，会绕过钳制；启用钳制时请勿走该路径。
+
+## 12. logits 硬钳制（final_logits_clamp_value）
+
+**意图**：对齐 HF 参考：`lm_head(...).clamp(-v, v)`（v=30.0）。
+
+**修改要点**：
+
+- 各版本 `Qwen3NextForCausalLM.compute_logits`（及 MTP）在 `final_logits_clamp_value` 设置时对 logits 做硬钳制；config 默认 `None` 不启用。

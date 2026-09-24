@@ -31,7 +31,11 @@ from vllm.model_executor.models.utils import (
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs import Qwen3NextConfig
 
-from .vllm_qwen3_next_0_11_0 import Qwen3NextDecoderLayer, _get_qwen3_next_norm_cls
+from .vllm_qwen3_next_0_11_0 import (
+    Qwen3NextDecoderLayer,
+    _get_qwen3_next_norm_cls,
+    _maybe_enable_activation_clamp,
+)
 
 logger = init_logger(__name__)
 
@@ -247,6 +251,7 @@ class Qwen3NextMTP(nn.Module, SupportsPP):
 
         super().__init__()
         self.config = config
+        _maybe_enable_activation_clamp(config)  # @gyzp MLP gate/up soft clamp
         self.model = Qwen3NextMultiTokenPredictor(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "mtp")
         )
@@ -287,7 +292,12 @@ class Qwen3NextMTP(nn.Module, SupportsPP):
         hidden_states: torch.Tensor,
         spec_step_idx: int = 0,
     ) -> Optional[torch.Tensor]:
-        return self.logits_processor(self.lm_head, hidden_states)
+        logits = self.logits_processor(self.lm_head, hidden_states)
+        # @gyzp hard clamp on final logits (same config as the main model)
+        clamp = getattr(self.config, "final_logits_clamp_value", None)
+        if clamp is not None:
+            logits = logits.clamp(-clamp, clamp)
+        return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         shared_weight_names = ["embed_tokens", "lm_head"]

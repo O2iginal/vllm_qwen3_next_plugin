@@ -13,6 +13,8 @@ try:
         from .vllm_qwen3_next_0_11_0 import Qwen3NextForCausalLM
     elif vllm_version.startswith("0.15"):
         from .vllm_qwen3_next_0_15_1 import Qwen3NextForCausalLM
+    elif vllm_version.startswith("0.18"):
+        from .vllm_qwen3_next_0_18_1 import Qwen3NextForCausalLM
     else:
         # Default to 0.11.0 if version check fails
         from .vllm_qwen3_next_0_11_0 import Qwen3NextForCausalLM
@@ -32,7 +34,9 @@ def register():
     # our class into the configs module under "Qwen3NextConfig" instead of replacing the registry.
     import vllm.transformers_utils.configs as vllm_configs_module
     vllm_version = vllm.__version__
-    if vllm_version.startswith("0.15"):
+    if vllm_version.startswith("0.18"):
+        from .vllm_qwen3_next_config_0_18_1 import Qwen3NextConfig as PluginQwen3NextConfig
+    elif vllm_version.startswith("0.15"):
         from .vllm_qwen3_next_config_0_15_1 import Qwen3NextConfig as PluginQwen3NextConfig
     else:
         from .vllm_qwen3_next_config_0_11_0 import Qwen3NextConfig as PluginQwen3NextConfig
@@ -83,10 +87,25 @@ def register():
             f"{GREEN}[vLLM Plugin] Registered Qwen3NextMTP (v0.15.1) with custom support{RESET}"
         )
         ModelRegistry.register_model("Qwen3NextMTP", Qwen3NextMTP)
+    elif vllm_version.startswith("0.18"):
+        from .vllm_qwen3_next_0_18_1 import Qwen3NextForCausalLM
+
+        print(
+            f"{GREEN}[vLLM Plugin] Loaded implementation for vLLM {vllm_version}{RESET}"
+        )
+        ModelRegistry.register_model("Qwen3NextForCausalLM", Qwen3NextForCausalLM)
+        print(
+            f"{GREEN}[vLLM Plugin] Registered Qwen3NextForCausalLM with custom support{RESET}"
+        )
+        from .vllm_qwen3_next_mtp_0_18_1 import Qwen3NextMTP
+        print(
+            f"{GREEN}[vLLM Plugin] Registered Qwen3NextMTP (v0.18.1) with custom support{RESET}"
+        )
+        ModelRegistry.register_model("Qwen3NextMTP", Qwen3NextMTP)
     else:
         raise ImportError(
             f"Unsupported vLLM version: {vllm_version}. "
-            "Supported versions: 0.10.2, 0.11.0, 0.15.x"
+            "Supported versions: 0.10.2, 0.11.0, 0.15.x, 0.18.x"
         )
 
     print(

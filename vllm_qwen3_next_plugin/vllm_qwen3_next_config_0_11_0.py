@@ -255,6 +255,11 @@ class Qwen3NextConfig(PretrainedConfig):
         gated_norm_rank=16,
         gated_norm_gate_scale=1.0,
         attn_qk_norm=False,
+        # @gyzp training-side inference features
+        moe_router_sqrt_gate=False,
+        activation_func_clamp_value=None,
+        activation_func_clamp_mode="soft",
+        final_logits_clamp_value=None,
         **kwargs,
     ):
         # @gyzp validate custom position embedding types
@@ -334,6 +339,11 @@ class Qwen3NextConfig(PretrainedConfig):
         self.gated_norm_rank = gated_norm_rank
         self.gated_norm_gate_scale = gated_norm_gate_scale
         self.attn_qk_norm = attn_qk_norm
+        # @gyzp training-side inference features
+        self.moe_router_sqrt_gate = moe_router_sqrt_gate
+        self.activation_func_clamp_value = activation_func_clamp_value
+        self.activation_func_clamp_mode = activation_func_clamp_mode
+        self.final_logits_clamp_value = final_logits_clamp_value
 
 
 __all__ = ["Qwen3NextConfig"]

@@ -283,6 +283,123 @@ class Qwen3NextMLPWithTokenShift(nn.Module):
         return down
 
 
+# ---------------------------------------------------------------------------
+# @gyzp: training-side inference features (all config-gated; defaults no-op)
+#   1) moe_router_sqrt_gate: softmax -> top-k -> L1 renorm -> sqrt(weight),
+#      no renorm afterwards (Megatron router semantics).
+#   2) activation_func_clamp_value: soft clamp c*tanh(x/c) on MLP gate/up
+#      BEFORE silu(gate) * up; applies to dense MLPs, the shared expert and
+#      routed experts (HF reference semantics).
+#   3) final_logits_clamp_value: hard clamp on final logits.
+# ---------------------------------------------------------------------------
+
+
+def _get_activation_clamp_value(config) -> float | None:
+    value = getattr(config, "activation_func_clamp_value", None)
+    if value is None:
+        return None
+    mode = getattr(config, "activation_func_clamp_mode", "soft")
+    if mode != "soft":
+        raise ValueError(
+            f"activation_func_clamp_mode={mode!r} is not supported; "
+            "only 'soft' (c * tanh(x / c)) is implemented."
+        )
+    return float(value)
+
+
+_ACTIVATION_CLAMP_VALUE: float | None = None
+_ORIG_SILU_AND_MUL = None
+
+
+class _SiluAndMulClampShim:
+    """OpOverloadPacket-compatible wrapper for torch.ops._C.silu_and_mul.
+
+    __call__ applies the optional soft clamp; every other attribute
+    (.default, .cuda, ...) is delegated to the original OpOverloadPacket so
+    consumers such as vllm.compilation pass infrastructure (which do
+    `torch.ops._C.silu_and_mul.default` for pattern matching) keep working.
+    With the clamp inactive, behavior is indistinguishable from the
+    original packet.
+    """
+
+    def __init__(self, orig_packet) -> None:
+        self._orig_packet = orig_packet
+
+    def __call__(self, out: torch.Tensor, x: torch.Tensor):
+        c = _ACTIVATION_CLAMP_VALUE
+        if c is None:
+            return self._orig_packet(out, x)
+        gate, up = x.chunk(2, dim=-1)
+        gate = c * torch.tanh(gate / c)
+        up = c * torch.tanh(up / c)
+        out.copy_(F.silu(gate) * up)
+
+    def __getattr__(self, name: str):
+        return getattr(self._orig_packet, name)
+
+
+def _install_silu_clamp_shim() -> None:
+    """Shadow torch.ops._C.silu_and_mul with a clamp-aware wrapper.
+
+    The fused-MoE paths (Triton/modular/cutlass) look the op up at call time,
+    and SiluAndMul binds it at module construction (which happens after this
+    module is imported), so a single shim covers dense MLPs, the shared
+    expert and routed experts. It is a pure passthrough unless
+    _ACTIVATION_CLAMP_VALUE is set, so other checkpoints are unaffected.
+    Note: pure-torch native (CPU) fallbacks and the flashinfer-cutlass MoE
+    path do not go through this op and are not covered.
+    """
+    global _ORIG_SILU_AND_MUL
+    if _ORIG_SILU_AND_MUL is not None:
+        return
+    import vllm._custom_ops  # noqa: F401  (ensures torch.ops._C is loaded)
+
+    _ORIG_SILU_AND_MUL = torch.ops._C.silu_and_mul
+    torch.ops._C.silu_and_mul = _SiluAndMulClampShim(_ORIG_SILU_AND_MUL)
+
+
+_install_silu_clamp_shim()
+
+
+def _maybe_enable_activation_clamp(config) -> None:
+    """Activate the silu_and_mul clamp shim for this process if configured."""
+    global _ACTIVATION_CLAMP_VALUE
+    value = _get_activation_clamp_value(config)
+    if value is None:
+        return
+    if _ACTIVATION_CLAMP_VALUE is not None and _ACTIVATION_CLAMP_VALUE != value:
+        raise ValueError(
+            "Conflicting activation_func_clamp_value: "
+            f"{_ACTIVATION_CLAMP_VALUE} vs {value}"
+        )
+    _ACTIVATION_CLAMP_VALUE = value
+
+
+def _sqrt_gate_routing_function(
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """softmax -> top-k -> L1 renorm -> sqrt of the selected weights.
+
+    Matches Megatron moe_router_sqrt_gate: sqrt replaces the combine weight
+    of selected experts only; selection is unchanged (sqrt is monotonic) and
+    there is NO renormalization afterwards.
+    """
+    from vllm.model_executor.layers.fused_moe.router.fused_topk_router import (
+        fused_topk,
+    )
+
+    topk_weights, topk_ids, _ = fused_topk(
+        hidden_states=hidden_states,
+        gating_output=gating_output,
+        topk=topk,
+        renormalize=renormalize,
+    )
+    return topk_weights.sqrt(), topk_ids
+
+
 class Qwen3NextSparseMoeBlock(nn.Module):
     def __init__(self, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -378,6 +495,12 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             enable_eplb=self.enable_eplb,
             num_redundant_experts=self.n_redundant_experts,
             is_sequence_parallel=self.is_sequence_parallel,
+            # @gyzp sqrt-gate: sqrt of selected (post-renorm) combine weights
+            custom_routing_function=(
+                _sqrt_gate_routing_function
+                if getattr(config, "moe_router_sqrt_gate", False)
+                else None
+            ),
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -1592,6 +1715,7 @@ class Qwen3NextForCausalLM(
         super().__init__()
         self.config = config
         self.scheduler_config = scheduler_config
+        _maybe_enable_activation_clamp(config)  # @gyzp MLP gate/up soft clamp
         self.model = Qwen3NextModel(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
@@ -1665,7 +1789,12 @@ class Qwen3NextForCausalLM(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
-        return self.logits_processor(self.lm_head, hidden_states)
+        logits = self.logits_processor(self.lm_head, hidden_states)
+        # @gyzp hard clamp on final logits (HF reference semantics)
+        clamp = getattr(self.config, "final_logits_clamp_value", None)
+        if clamp is not None:
+            logits = logits.clamp(-clamp, clamp)
+        return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(
