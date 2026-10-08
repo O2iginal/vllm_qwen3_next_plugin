@@ -678,7 +678,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         # time step projection (discretization)
         # instantiate once and copy inv_dt in init_weights of PretrainedModel
         self.dt_bias = nn.Parameter(
-            torch.ones(self.num_v_heads // self.tp_size),
+            torch.ones(self.num_v_heads // self.tp_size, dtype=torch.float32),
         )
         self.A_log = nn.Parameter(
             torch.empty(
@@ -942,7 +942,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                     positions_non_spec, query_non_spec, key_non_spec
                 )
 
-        beta = b.sigmoid()
+        beta = b.float().sigmoid()
         # g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
         g = fused_gdn_gating(self.A_log, a, self.dt_bias)
 

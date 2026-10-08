@@ -825,11 +825,12 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         # time step projection (discretization)
         # instantiate once and copy inv_dt in init_weights of PretrainedModel
         self.dt_bias = nn.Parameter(
-            torch.ones(self.num_v_heads // self.tp_size),
+            torch.ones(self.num_v_heads // self.tp_size, dtype=torch.float32),
         )
         self.A_log = nn.Parameter(
             torch.empty(
                 divide(self.num_v_heads, self.tp_size),
+                dtype=torch.float32,
             )
         )
 
@@ -1087,8 +1088,8 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             v = torch.randn(
                 1, T, num_v_heads, self.head_v_dim, device=device, dtype=dtype
             )
-            g = torch.randn(1, T, num_v_heads, device=device, dtype=dtype)
-            beta = torch.randn(1, T, num_v_heads, device=device, dtype=dtype)
+            g = torch.randn(1, T, num_v_heads, device=device, dtype=torch.float32)
+            beta = torch.randn(1, T, num_v_heads, device=device, dtype=torch.float32)
             state = torch.zeros(
                 1,
                 num_v_heads,
@@ -1411,7 +1412,10 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         fused_recurrent_gated_delta_rule_packed_decode(
             mixed_qkv=mixed_qkv_non_spec,
             a=a,
-            b=b,
+            # vLLM 0.18.1 rounds sigmoid(b) through b.dtype inside this kernel.
+            # Promote the small raw gate tensor, not Q/K/V, to keep beta in FP32.
+            # This avoids patching site-packages or disabling the packed path.
+            b=b.float(),
             A_log=self.A_log,
             dt_bias=self.dt_bias,
             scale=self.head_k_dim**-0.5,
@@ -2277,14 +2281,14 @@ def fused_gdn_gating(
     """
     Fused computation of g and beta for Gated Delta Net.
     g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
-    beta_output = b.sigmoid()
+    beta_output = b.float().sigmoid()
     TODO maybe use torch.compile to replace this triton kernel
     """
     batch, num_heads = a.shape
     seq_len = 1
     grid = (batch, seq_len, triton.cdiv(num_heads, 8))
     g = torch.empty(1, batch, num_heads, dtype=torch.float32, device=a.device)
-    beta_output = torch.empty(1, batch, num_heads, dtype=b.dtype, device=b.device)
+    beta_output = torch.empty(1, batch, num_heads, dtype=torch.float32, device=b.device)
     fused_gdn_gating_kernel[grid](
         g,
         beta_output,

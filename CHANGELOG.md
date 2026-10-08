@@ -1,5 +1,17 @@
 # Qwen3-Next 自定义修改记录 (Custom Modifications)
 
+## 2026-10-08：GDN 精度修复
+
+- 所有现有版本实现显式保留 `A_log` / `dt_bias` 为 FP32，避免 BF16 加载舍入。
+- prefill 的 sigmoid(beta) 计算与输出保持 FP32；0.18.1 warmup dtype 同步。
+- 0.18.1 packed decode 仅将原始门控 `b` 提升为 FP32，绕过上游内核的
+  sigmoid→BF16→FP32 舍入，不修改 site-packages，不关闭 packed 快速路径。
+- 不改变主权重、激活和 SSM cache 的默认 dtype；后者仍用启动参数独立控制。
+- 增加 CPU 回归测试及必须显式启用的 GPU 内核测试。
+- 详细验证边界与 H20 命令见 [精度修复记录](docs/2026-10-08-gdn-precision.md)。
+
+---
+
 基于 vLLM 官方 Qwen3-Next 实现，进行自定义修改，按照修改顺序记录如下修改清单，便于升级 vLLM 版本时复用到新代码。
 
 涉及文件：
