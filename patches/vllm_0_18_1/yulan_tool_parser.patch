@@ -1,0 +1,253 @@
+diff --git a/vllm/tool_parsers/__init__.py b/vllm/tool_parsers/__init__.py
+index 111111111..222222222 100644
+--- a/vllm/tool_parsers/__init__.py
++++ b/vllm/tool_parsers/__init__.py
+@@ -145,6 +145,10 @@ _TOOL_PARSERS_TO_REGISTER = {
+         "xlam_tool_parser",
+         "xLAMToolParser",
+     ),
++    "yulan": (
++        "yulan_tool_parser",
++        "YulanToolParser",
++    ),
+     "gigachat3": (
+         "gigachat3_tool_parser",
+         "GigaChat3ToolParser",
+diff --git a/vllm/tool_parsers/yulan_tool_parser.py b/vllm/tool_parsers/yulan_tool_parser.py
+new file mode 100644
+index 000000000..333333333
+--- /dev/null
++++ b/vllm/tool_parsers/yulan_tool_parser.py
+@@ -0,0 +1,232 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++from collections.abc import Sequence
++from functools import wraps
++from threading import Lock, RLock
++from typing import Any
++
++from transformers import PreTrainedTokenizerFast
++
++from vllm.entrypoints.openai.chat_completion.protocol import (
++    ChatCompletionRequest,
++)
++from vllm.entrypoints.openai.engine.protocol import (
++    DeltaMessage,
++    ExtractedToolCallInformation,
++)
++from vllm.logger import init_logger
++from vllm.tokenizers import TokenizerLike
++from vllm.tool_parsers.abstract_tool_parser import ToolParser
++from vllm.tool_parsers.hermes_tool_parser import Hermes2ProToolParser
++from vllm.tool_parsers.qwen3coder_tool_parser import Qwen3CoderToolParser
++
++logger = init_logger(__name__)
++_PARSER_INIT_LOCK = Lock()
++_FAST_TOKENIZER_LOCK = RLock()
++_FAST_TOKENIZER_METHODS = (
++    "__call__",
++    "encode",
++    "decode",
++    "batch_decode",
++    "get_vocab",
++)
++
++
++def _serialize_fast_tokenizer_methods(tokenizer_cls: type[Any]) -> None:
++    """Serialize mutable Rust-tokenizer access without changing its output."""
++    for method_name in _FAST_TOKENIZER_METHODS:
++        original = getattr(tokenizer_cls, method_name)
++        if getattr(original, "_yulan_serialized", False):
++            continue
++
++        @wraps(original)
++        def locked_method(*args, _original=original, **kwargs):
++            with _FAST_TOKENIZER_LOCK:
++                return _original(*args, **kwargs)
++
++        locked_method._yulan_serialized = True
++        setattr(tokenizer_cls, method_name, locked_method)
++
++
++_serialize_fast_tokenizer_methods(PreTrainedTokenizerFast)
++
++
++class YulanToolParser(ToolParser):
++    """Parse both Qwen3-Coder XML-style and Hermes JSON-style tool calls."""
++
++    def __init__(self, tokenizer: TokenizerLike):
++        super().__init__(tokenizer)
++        self.qwen3_coder: Qwen3CoderToolParser | None = None
++        self.hermes: Hermes2ProToolParser | None = None
++        self._streaming_delegate: str | None = None
++
++        # Fast tokenizers reject simultaneous mutable configuration changes
++        # with ``RuntimeError: Already borrowed``. Both delegated parser
++        # constructors encode their marker tokens, so serialize construction
++        # while keeping request parsing itself fully concurrent.
++        with _PARSER_INIT_LOCK:
++            try:
++                self.qwen3_coder = Qwen3CoderToolParser(tokenizer)
++            except Exception:
++                logger.exception("Failed to initialize qwen3_coder tool parser.")
++
++            try:
++                self.hermes = Hermes2ProToolParser(tokenizer)
++            except Exception:
++                logger.exception("Failed to initialize hermes tool parser.")
++
++        if self.qwen3_coder is None and self.hermes is None:
++            raise RuntimeError(
++                "Yulan tool parser could not initialize either qwen3_coder "
++                "or hermes parser."
++            )
++
++        self.tool_call_start_token = "<tool_call>"
++        self.tool_call_end_token = "</tool_call>"
++        self.qwen_function_prefix = "<function="
++
++    def _sync_state_from(self, parser: ToolParser) -> None:
++        self.prev_tool_call_arr = parser.prev_tool_call_arr
++        self.current_tool_id = parser.current_tool_id
++        self.current_tool_name_sent = parser.current_tool_name_sent
++        self.streamed_args_for_tool = parser.streamed_args_for_tool
++
++    def _extract_with_qwen(
++        self, model_output: str, request: ChatCompletionRequest
++    ) -> ExtractedToolCallInformation | None:
++        if self.qwen3_coder is None:
++            return None
++
++        extracted = self.qwen3_coder.extract_tool_calls(model_output, request)
++        self._sync_state_from(self.qwen3_coder)
++        return extracted if extracted.tools_called else None
++
++    def _extract_with_hermes(
++        self, model_output: str, request: ChatCompletionRequest
++    ) -> ExtractedToolCallInformation | None:
++        if self.hermes is None:
++            return None
++
++        extracted = self.hermes.extract_tool_calls(model_output, request)
++        self._sync_state_from(self.hermes)
++        return extracted if extracted.tools_called else None
++
++    def _delegate_streaming(
++        self,
++        parser: ToolParser,
++        previous_text: str,
++        current_text: str,
++        delta_text: str,
++        previous_token_ids: Sequence[int],
++        current_token_ids: Sequence[int],
++        delta_token_ids: Sequence[int],
++        request: ChatCompletionRequest,
++    ) -> DeltaMessage | None:
++        delta = parser.extract_tool_calls_streaming(
++            previous_text=previous_text,
++            current_text=current_text,
++            delta_text=delta_text,
++            previous_token_ids=previous_token_ids,
++            current_token_ids=current_token_ids,
++            delta_token_ids=delta_token_ids,
++            request=request,
++        )
++        self._sync_state_from(parser)
++        return delta
++
++    def _choose_streaming_delegate(self, current_text: str) -> str | None:
++        last_tool_start = current_text.rfind(self.tool_call_start_token)
++        if last_tool_start < 0:
++            return None
++
++        tool_payload = current_text[
++            last_tool_start + len(self.tool_call_start_token) :
++        ].lstrip()
++
++        if tool_payload.startswith(self.qwen_function_prefix):
++            return "qwen3_coder"
++        if tool_payload.startswith("{"):
++            return "hermes"
++        if self.qwen_function_prefix in tool_payload:
++            return "qwen3_coder"
++        return None
++
++    def adjust_request(self, request: ChatCompletionRequest) -> ChatCompletionRequest:
++        if self.hermes is not None:
++            request = self.hermes.adjust_request(request)
++        else:
++            request = super().adjust_request(request)
++
++        if request.tools and request.tool_choice != "none":
++            request.skip_special_tokens = False
++        return request
++
++    def extract_tool_calls(
++        self,
++        model_output: str,
++        request: ChatCompletionRequest,
++    ) -> ExtractedToolCallInformation:
++        if self.qwen_function_prefix in model_output:
++            extracted = self._extract_with_qwen(model_output, request)
++            if extracted is not None:
++                return extracted
++            extracted = self._extract_with_hermes(model_output, request)
++            if extracted is not None:
++                return extracted
++        else:
++            extracted = self._extract_with_hermes(model_output, request)
++            if extracted is not None:
++                return extracted
++            extracted = self._extract_with_qwen(model_output, request)
++            if extracted is not None:
++                return extracted
++
++        return ExtractedToolCallInformation(
++            tools_called=False, tool_calls=[], content=model_output
++        )
++
++    def extract_tool_calls_streaming(
++        self,
++        previous_text: str,
++        current_text: str,
++        delta_text: str,
++        previous_token_ids: Sequence[int],
++        current_token_ids: Sequence[int],
++        delta_token_ids: Sequence[int],
++        request: ChatCompletionRequest,
++    ) -> DeltaMessage | None:
++        if not previous_text:
++            self._streaming_delegate = None
++
++        if self._streaming_delegate is None:
++            self._streaming_delegate = self._choose_streaming_delegate(current_text)
++
++        if self._streaming_delegate == "qwen3_coder" and self.qwen3_coder is not None:
++            return self._delegate_streaming(
++                self.qwen3_coder,
++                previous_text,
++                current_text,
++                delta_text,
++                previous_token_ids,
++                current_token_ids,
++                delta_token_ids,
++                request,
++            )
++
++        if self._streaming_delegate == "hermes" and self.hermes is not None:
++            return self._delegate_streaming(
++                self.hermes,
++                previous_text,
++                current_text,
++                delta_text,
++                previous_token_ids,
++                current_token_ids,
++                delta_token_ids,
++                request,
++            )
++
++        if self.tool_call_start_token in current_text:
++            return None
++
++        return DeltaMessage(content=delta_text)
